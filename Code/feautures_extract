@@ -1,0 +1,264 @@
+import os
+import mne
+import numpy as np
+import pandas as pd
+from scipy.stats import skew, kurtosis
+import antropy as ant
+import traceback
+
+mne.set_log_level("WARNING")
+
+# CONFIG
+base_dir = "derivatives"
+output_file = "EEG_channelwise_features_with_connectivity.csv"
+subject_ids = [f"sub-{i:03d}" for i in range(1, 89)]
+
+freq_bands = {
+    "delta": (0.5, 4),
+    "theta": (4, 8),
+    "alpha": (8, 13),
+    "beta": (13, 25),
+    "gamma": (25, 45)
+}
+
+epoch_duration = 1.0
+epoch_overlap = 0.5
+participants_df = pd.read_csv("participants.tsv", sep="\t").set_index("participant_id")
+
+def hjorth_parameters(sig):
+    diff1 = np.diff(sig)
+    diff2 = np.diff(diff1)
+    var_zero = np.var(sig)
+    var_d1 = np.var(diff1)
+    var_d2 = np.var(diff2)
+    mobility = np.sqrt(var_d1 / var_zero) if var_zero > 0 else 0
+    complexity = (np.sqrt(var_d2 / var_d1) / mobility) if var_d1 > 0 and mobility > 0 else 0
+    return mobility, complexity
+
+def calculate_channel_connectivity_features(epoch_data, target_channel_idx):
+    """Compute connectivity features for a specific channel with all other channels"""
+    n_epochs, n_channels, n_times = epoch_data.shape
+    
+    # Reshape to (n_channels, n_epochs * n_times) for correlation calculation
+    data_2d = epoch_data.transpose(1, 0, 2).reshape(n_channels, -1)
+    
+    # Calculate correlation of target channel with all other channels
+    target_signal = data_2d[target_channel_idx]
+    correlations = []
+    
+    for ch_idx in range(n_channels):
+        if ch_idx != target_channel_idx:
+            corr = np.corrcoef(target_signal, data_2d[ch_idx])[0, 1]
+            if not np.isnan(corr):
+                correlations.append(abs(corr))  # Use absolute correlation
+    
+    if len(correlations) == 0:
+        return {
+            "mean_connectivity": 0,
+            "std_connectivity": 0,
+            "max_connectivity": 0,
+            "median_connectivity": 0
+        }
+    
+    correlations = np.array(correlations)
+    
+    connectivity_features = {
+        "mean_connectivity": np.mean(correlations),
+        "median_connectivity": np.median(correlations),
+        "std_connectivity": np.std(correlations),
+        "max_connectivity": np.max(correlations),
+        "connectivity_90th_percentile": np.percentile(correlations, 90),
+        "strong_connections_ratio": np.mean(correlations > 0.5)  # Proportion of strong connections
+    }
+    
+    return connectivity_features
+
+def calculate_additional_time_domain_features(sig):
+    """Calculate additional time-domain complexity features"""
+    features = {}
+    
+    # Zero-crossing rate
+    zero_crossings = np.sum(np.diff(np.sign(sig)) != 0)
+    features["zero_crossing_rate"] = zero_crossings / len(sig)
+    
+    # Root mean square
+    features["rms"] = np.sqrt(np.mean(sig**2))
+    
+    # Peak-to-peak amplitude
+    features["peak_to_peak"] = np.ptp(sig)
+    
+    # Mean absolute deviation
+    features["mean_abs_deviation"] = np.mean(np.abs(sig - np.mean(sig)))
+    
+    return features
+
+all_rows = []
+
+for subj_id in subject_ids:
+    eeg_file = os.path.join(base_dir, subj_id, "eeg", f"{subj_id}_task-eyesclosed_eeg.set")
+
+    if not os.path.exists(eeg_file):
+        print(f"❌ Missing: {subj_id}")
+        continue
+
+    try:
+        print(f"\n✅ Processing {subj_id}")
+        raw = mne.io.read_raw_eeglab(eeg_file, preload=True)
+        raw.pick("eeg")
+        ch_names = raw.info["ch_names"]
+        epochs = mne.make_fixed_length_epochs(raw, duration=epoch_duration, overlap=epoch_overlap, preload=True)
+
+        psd_obj = epochs.compute_psd(fmin=0.5, fmax=45.0, method="welch")
+        psds = psd_obj.get_data()  # shape: (n_epochs, n_channels, n_freqs)
+        freqs = psd_obj.freqs
+        epoch_data = epochs.get_data()  # shape: (n_epochs, n_channels, n_times)
+
+        n_epochs, n_channels, n_times = epoch_data.shape
+        total_power_all = np.sum(psds, axis=2) + 1e-12  # avoid division by zero
+
+        # Compute RBP for each band
+        band_rbp = {}
+        for band, (fmin, fmax) in freq_bands.items():
+            mask = (freqs >= fmin) & (freqs < fmax)
+            band_power = np.sum(psds[:, :, mask], axis=2)
+            band_rbp[band] = band_power / total_power_all  # shape: (n_epochs, n_channels)
+
+        # Compute ratios per channel
+        alpha_vals = band_rbp["alpha"]
+        beta_vals = band_rbp["beta"]
+        theta_vals = band_rbp["theta"] + 1e-12
+        alpha_theta = alpha_vals / theta_vals
+        beta_theta = beta_vals / theta_vals
+
+        # Basic statistical features
+        stat_features = {
+            "mean": np.mean(epoch_data, axis=2),
+            "std": np.std(epoch_data, axis=2),
+            "var": np.var(epoch_data, axis=2),
+            "skewness": np.apply_along_axis(skew, 2, epoch_data),
+            "kurtosis": np.apply_along_axis(kurtosis, 2, epoch_data),
+        }
+
+        # Hjorth Parameters, Entropy, and Sample Entropy
+        hjorth_mobility = np.full((n_epochs, n_channels), np.nan)
+        hjorth_complexity = np.full((n_epochs, n_channels), np.nan)
+        ap_entropy = np.full((n_epochs, n_channels), np.nan)
+        sample_entropy = np.full((n_epochs, n_channels), np.nan)
+        
+        # Additional time-domain features
+        additional_features = {
+            "zero_crossing_rate": np.full((n_epochs, n_channels), np.nan),
+            "rms": np.full((n_epochs, n_channels), np.nan),
+            "peak_to_peak": np.full((n_epochs, n_channels), np.nan),
+            "mean_abs_deviation": np.full((n_epochs, n_channels), np.nan)
+        }
+
+        for ep in range(n_epochs):
+            for ch in range(n_channels):
+                sig = epoch_data[ep, ch]
+                try:
+                    hjorth_mobility[ep, ch], hjorth_complexity[ep, ch] = hjorth_parameters(sig)
+                    ap_entropy[ep, ch] = ant.app_entropy(sig)
+                    sample_entropy[ep, ch] = ant.sample_entropy(sig)
+                    
+                    # Additional time-domain features
+                    add_feats = calculate_additional_time_domain_features(sig)
+                    for feat_name, feat_val in add_feats.items():
+                        additional_features[feat_name][ep, ch] = feat_val
+                        
+                except Exception as e:
+                    # Optionally print specific errors for debugging
+                    # print(f"Error processing epoch {ep}, channel {ch}: {e}")
+                    pass  # ignore errors for bad epochs
+
+        # Define statistics to compute across epochs
+        stats_to_compute = {
+            'mean': np.mean,
+            'std': np.std,
+            'median': np.median,
+            'max': np.max,
+            'min': np.min,
+            'q25': lambda x: np.percentile(x, 25),
+            'q75': lambda x: np.percentile(x, 75)
+        }
+
+        # Process each channel
+        for ch_idx, ch_name in enumerate(ch_names):
+            row = {
+                "subject_id": subj_id,
+                "group": participants_df.loc[subj_id]["Group"] if subj_id in participants_df.index else "Unknown",
+                "channel": ch_name
+            }
+
+            # Spectral features (relative band powers) - multiple statistics
+            for band in freq_bands.keys():
+                band_values = band_rbp[band][:, ch_idx]
+                for stat_name, stat_func in stats_to_compute.items():
+                    row[f"{band}_power_{stat_name}"] = stat_func(band_values)
+
+            # Spectral ratios - multiple statistics
+            alpha_theta_values = alpha_theta[:, ch_idx]
+            beta_theta_values = beta_theta[:, ch_idx]
+            
+            for stat_name, stat_func in stats_to_compute.items():
+                row[f"alpha_theta_ratio_{stat_name}"] = stat_func(alpha_theta_values)
+                row[f"beta_theta_ratio_{stat_name}"] = stat_func(beta_theta_values)
+
+            # Basic statistical features (time-domain) - multiple statistics
+            for feat_name, feat_array in stat_features.items():
+                feat_values = feat_array[:, ch_idx]
+                for stat_name, stat_func in stats_to_compute.items():
+                    row[f"{feat_name}_{stat_name}"] = stat_func(feat_values)
+
+            # Complexity features - multiple statistics (using nanmean variants for NaN handling)
+            complexity_arrays = {
+                "hjorth_mobility": hjorth_mobility[:, ch_idx],
+                "hjorth_complexity": hjorth_complexity[:, ch_idx],
+                "ap_entropy": ap_entropy[:, ch_idx],
+                "sample_entropy": sample_entropy[:, ch_idx]
+            }
+            
+            for feat_name, feat_values in complexity_arrays.items():
+                # Remove NaN values before computing statistics
+                valid_values = feat_values[~np.isnan(feat_values)]
+                if len(valid_values) > 0:
+                    for stat_name, stat_func in stats_to_compute.items():
+                        row[f"{feat_name}_{stat_name}"] = stat_func(valid_values)
+                else:
+                    # If all values are NaN, set to 0 or NaN
+                    for stat_name in stats_to_compute.keys():
+                        row[f"{feat_name}_{stat_name}"] = 0
+            
+            # Additional time-domain features - multiple statistics
+            for feat_name, feat_array in additional_features.items():
+                feat_values = feat_array[:, ch_idx]
+                # Remove NaN values
+                valid_values = feat_values[~np.isnan(feat_values)]
+                if len(valid_values) > 0:
+                    for stat_name, stat_func in stats_to_compute.items():
+                        row[f"{feat_name}_{stat_name}"] = stat_func(valid_values)
+                else:
+                    for stat_name in stats_to_compute.keys():
+                        row[f"{feat_name}_{stat_name}"] = 0
+
+            # Channel-specific connectivity features (these are already aggregated per channel)
+            connectivity_features = calculate_channel_connectivity_features(epoch_data, ch_idx)
+            row.update(connectivity_features)
+
+            all_rows.append(row)
+
+    except Exception as e:
+        print(f"❌ Error for {subj_id}: {e}")
+        traceback.print_exc()
+
+# Create DataFrame and save
+df = pd.DataFrame(all_rows)
+df.to_csv(output_file, index=False)
+print(f"\n✅ Done! Features saved to {output_file}")
+print(f"📊 Total features per channel: {len(df.columns) - 3}")  # -3 for subject_id, group, channel
+print(f"📊 Feature categories:")
+print(f"   - Spectral: {len(freq_bands)} bands × 7 statistics + 2 ratios × 7 statistics = {len(freq_bands) * 7 + 2 * 7}")
+print(f"   - Time-domain: 9 features × 7 statistics = {9 * 7}")
+print(f"   - Complexity: 4 features × 7 statistics = {4 * 7}")
+print(f"   - Connectivity: 4 features per channel")
+print(f"   - Total per channel: ~{len(freq_bands) * 7 + 2 * 7 + 9 * 7 + 4 * 7 + 4} features")
