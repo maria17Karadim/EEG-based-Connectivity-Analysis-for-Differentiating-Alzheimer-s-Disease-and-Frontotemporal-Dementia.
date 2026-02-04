@@ -1,1 +1,1165 @@
 
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+# Suppress TensorFlow warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, label_binarize
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_curve, auc, balanced_accuracy_score, roc_auc_score
+from sklearn.utils.class_weight import compute_class_weight
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import (Conv2D, MaxPooling2D, Dense, Dropout, 
+                                   BatchNormalization, GlobalAveragePooling2D,
+                                   Activation, Flatten)
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.utils import to_categorical
+import mne
+from scipy import signal
+from tqdm import tqdm
+from datetime import datetime
+import json
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import precision_recall_fscore_support
+
+# Create directories for saving plots
+os.makedirs('confusion_matrices', exist_ok=True)
+os.makedirs('roc_curves', exist_ok=True)
+
+
+class Basic2DCNN:
+    """
+    Basic 2D CNN for EEG classification using spectrograms
+    - 2-second windows with 50% overlap
+    - Multi-channel spectrograms and spatial electrode arrangements
+    - Simpler architecture focused on automatic feature learning
+    """
+    
+    def __init__(self, data_path, participants_file, window_length=2.0, 
+                 overlap=0.5, freq_min=0.5, freq_max=45, nperseg=256):
+        """
+        Initialize the Basic 2D CNN EEG Classifier
+        
+        Parameters:
+        -----------
+        window_length : float, default=2.0
+            Length of EEG windows in seconds (2-second windows as specified)
+        overlap : float, default=0.5
+            Window overlap (50% overlap as specified)
+        """
+        self.data_path = data_path
+        self.participants_file = participants_file
+        self.window_length = window_length
+        self.overlap = overlap
+        self.freq_min = freq_min
+        self.freq_max = freq_max
+        self.nperseg = nperseg
+        self.model = None
+        self.label_encoder = LabelEncoder()
+        self.classification_task = None
+        self.all_results_data = []  # Store all results for comprehensive CSV
+        
+        # Enhanced spatial electrode arrangement based on 10-20 system
+        # More comprehensive electrode positioning for better spatial representation
+        self.electrode_positions = {
+            # Frontal electrodes
+            'Fp1': (0, 1), 'Fpz': (0, 2), 'Fp2': (0, 3),
+            'AF3': (0, 1), 'AF4': (0, 3), 'AFz': (0, 2),
+            'F7': (1, 0), 'F3': (1, 1), 'Fz': (1, 2), 'F4': (1, 3), 'F8': (1, 4),
+            'FT7': (1, 0), 'FC3': (1, 1), 'FCz': (1, 2), 'FC4': (1, 3), 'FT8': (1, 4),
+            
+            # Central electrodes
+            'T7': (2, 0), 'C3': (2, 1), 'Cz': (2, 2), 'C4': (2, 3), 'T8': (2, 4),
+            
+            # Parietal electrodes
+            'TP7': (3, 0), 'CP3': (3, 1), 'CPz': (3, 2), 'CP4': (3, 3), 'TP8': (3, 4),
+            'P7': (3, 0), 'P3': (3, 1), 'Pz': (3, 2), 'P4': (3, 3), 'P8': (3, 4),
+            
+            # Occipital electrodes
+            'PO3': (4, 1), 'POz': (4, 2), 'PO4': (4, 3),
+            'O1': (4, 1), 'Oz': (4, 2), 'O2': (4, 3)
+        }
+        
+        # Define spatial grid size (5x5 for comprehensive coverage)
+        self.spatial_grid_size = (5, 5)
+        
+        # Validate paths
+        self._validate_paths()
+        
+    def _validate_paths(self):
+        """Validate that required paths exist"""
+        if not os.path.exists(self.data_path):
+            raise ValueError(f"Data path does not exist: {self.data_path}")
+        if not os.path.exists(self.participants_file):
+            raise ValueError(f"Participants file does not exist: {self.participants_file}")
+
+    def calculate_comprehensive_metrics(self, y_true, y_pred, y_pred_proba=None):
+        """
+        Calculate the requested metrics: Accuracy, Balanced Accuracy, Specificity, F1 Score, and AUC
+        Enhanced to handle multi-class AUC calculation
+        
+        Parameters:
+        -----------
+        y_true : array-like
+            True labels
+        y_pred : array-like
+            Predicted labels
+        y_pred_proba : array-like, optional
+            Prediction probabilities for AUC calculation
+            
+        Returns:
+        --------
+        dict : Dictionary containing the requested metrics
+        """
+        # Accuracy
+        accuracy = accuracy_score(y_true, y_pred)
+        
+        # Balanced Accuracy
+        balanced_accuracy = balanced_accuracy_score(y_true, y_pred)
+        
+        # F1 Score (macro average)
+        precision, recall, f1, support = precision_recall_fscore_support(
+            y_true, y_pred, average='macro', zero_division=0
+        )
+        
+        # Calculate confusion matrix for specificity
+        cm = confusion_matrix(y_true, y_pred)
+        
+        # Calculate specificity (macro average)
+        specificity_per_class = []
+        for i in range(len(cm)):
+            # True Negatives: sum of all cells except row i and column i
+            tn = np.sum(cm) - (np.sum(cm[i, :]) + np.sum(cm[:, i]) - cm[i, i])
+            # False Positives: sum of column i except diagonal
+            fp = np.sum(cm[:, i]) - cm[i, i]
+            
+            # Specificity = TN / (TN + FP)
+            if (tn + fp) > 0:
+                specificity = tn / (tn + fp)
+            else:
+                specificity = 0.0
+            specificity_per_class.append(specificity)
+        
+        specificity_macro = np.mean(specificity_per_class)
+        
+        # Enhanced AUC calculation for both binary and multi-class
+        auc_score = np.nan
+        n_classes = len(np.unique(y_true))
+        
+        if y_pred_proba is not None:
+            try:
+                if n_classes == 2:
+                    # Binary classification - use traditional ROC AUC
+                    fpr, tpr, _ = roc_curve(y_true, y_pred_proba)
+                    auc_score = auc(fpr, tpr)
+                else:
+                    # Multi-class classification - use one-vs-rest AUC (macro average)
+                    # Convert y_pred_proba to the format expected by roc_auc_score
+                    if y_pred_proba.ndim == 1:
+                        # If we only have max probabilities, we can't calculate multi-class AUC properly
+                        # This is a limitation - we need the full probability matrix
+                        print("Warning: Multi-class AUC calculation requires full probability matrix")
+                        auc_score = np.nan
+                    else:
+                        # We have the full probability matrix - use it for multi-class AUC
+                        auc_score = roc_auc_score(y_true, y_pred_proba, multi_class='ovr', average='macro')
+                        
+            except Exception as e:
+                print(f"Warning: Could not calculate AUC: {e}")
+                auc_score = np.nan
+        
+        # Return only the requested metrics
+        metrics = {
+            'accuracy': accuracy,
+            'balanced_accuracy': balanced_accuracy,
+            'specificity': specificity_macro,
+            'f1_score': f1,
+            'auc': auc_score,
+            'confusion_matrix': cm
+        }
+        
+        return metrics
+
+    def plot_confusion_matrix(self, cm, class_names, task_name, method_name, save_path=None):
+        """
+        Plot and save confusion matrix with enhanced visualization
+        """
+        plt.figure(figsize=(8, 6))
+        
+        # Normalize confusion matrix
+        cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        
+        # Create subplot for both raw and normalized
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+        
+        # Raw confusion matrix
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax1,
+                    xticklabels=class_names, yticklabels=class_names)
+        ax1.set_title(f'Confusion Matrix (Raw Counts)\n{task_name}')
+        ax1.set_ylabel('True Label')
+        ax1.set_xlabel('Predicted Label')
+        
+        # Normalized confusion matrix
+        sns.heatmap(cm_normalized, annot=True, fmt='.3f', cmap='Blues', ax=ax2,
+                    xticklabels=class_names, yticklabels=class_names)
+        ax2.set_title(f'Confusion Matrix (Normalized)\n{task_name}')
+        ax2.set_ylabel('True Label')
+        ax2.set_xlabel('Predicted Label')
+        
+        # Add configuration info
+        fig.suptitle(f'{task_name} - {method_name}', fontsize=12, y=0.95)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"    Confusion matrix saved: {save_path}")
+        
+        plt.close()
+
+    def plot_roc_curve(self, y_true, y_pred_proba, task_name, method_name, class_names, save_path=None):
+        """
+        Plot and save ROC curve for both binary and multi-class classification
+        """
+        try:
+            n_classes = len(class_names)
+            
+            if n_classes == 2:
+                # Binary classification - existing code
+                fpr, tpr, thresholds = roc_curve(y_true, y_pred_proba)
+                roc_auc = auc(fpr, tpr)
+                
+                plt.figure(figsize=(8, 6))
+                plt.plot(fpr, tpr, color='darkorange', lw=2, 
+                        label=f'ROC curve (AUC = {roc_auc:.3f})')
+                plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', 
+                        label='Random Classifier')
+                
+                plt.xlim([0.0, 1.0])
+                plt.ylim([0.0, 1.05])
+                plt.xlabel('False Positive Rate')
+                plt.ylabel('True Positive Rate')
+                plt.title(f'ROC Curve - {task_name}\n{method_name}')
+                plt.legend(loc="lower right")
+                
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                
+            else:
+                # Multi-class classification - one-vs-rest ROC curves
+                # Binarize the labels for one-vs-rest
+                y_true_bin = label_binarize(y_true, classes=range(n_classes))
+                
+                plt.figure(figsize=(10, 8))
+                
+                # Colors for each class
+                colors = ['blue', 'red', 'green', 'purple', 'orange', 'brown']
+                
+                # Calculate ROC curve for each class
+                mean_fpr = np.linspace(0, 1, 100)
+                tprs = []
+                aucs = []
+                
+                for i, class_name in enumerate(class_names):
+                    # Calculate ROC curve for class i vs rest
+                    fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_pred_proba[:, i])
+                    roc_auc = auc(fpr, tpr)
+                    aucs.append(roc_auc)
+                    
+                    # Plot ROC curve for this class
+                    color = colors[i % len(colors)]
+                    plt.plot(fpr, tpr, color=color, lw=2,
+                            label=f'{class_name} vs Rest (AUC = {roc_auc:.3f})')
+                    
+                    # Interpolate for mean calculation
+                    tpr_interp = np.interp(mean_fpr, fpr, tpr)
+                    tpr_interp[0] = 0.0
+                    tprs.append(tpr_interp)
+                
+                # Plot mean ROC curve
+                mean_tpr = np.mean(tprs, axis=0)
+                mean_tpr[-1] = 1.0
+                mean_auc = auc(mean_fpr, mean_tpr)
+                plt.plot(mean_fpr, mean_tpr, color='black', lw=3, linestyle='--',
+                        label=f'Mean ROC (AUC = {mean_auc:.3f})')
+                
+                # Plot random classifier
+                plt.plot([0, 1], [0, 1], color='gray', lw=2, linestyle=':',
+                        label='Random Classifier (AUC = 0.500)')
+                
+                plt.xlim([0.0, 1.0])
+                plt.ylim([0.0, 1.05])
+                plt.xlabel('False Positive Rate')
+                plt.ylabel('True Positive Rate')
+                plt.title(f'Multi-class ROC Curves - {task_name}\n{method_name}')
+                plt.legend(loc="lower right", fontsize=9)
+                
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                
+                roc_auc = mean_auc  # Return mean AUC for multi-class
+            
+            if save_path:
+                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                print(f"    ROC curve saved: {save_path}")
+            
+            plt.close()
+            
+            return roc_auc
+            
+        except Exception as e:
+            print(f"    Error plotting ROC curve: {str(e)}")
+            return np.nan
+    
+    def save_comprehensive_results_csv(self, timestamp):
+        """
+        Save all results from all experiments to a single comprehensive CSV file
+        """
+        if not self.all_results_data:
+            print("No results data to save")
+            return None
+            
+        filename = f"comprehensive_eeg_cnn_results_{timestamp}.csv"
+        
+        # Create DataFrame from all collected results
+        df = pd.DataFrame(self.all_results_data)
+        
+        # Sort by group comparison and method for better readability
+        df = df.sort_values(['group_comparison', 'method']).reset_index(drop=True)
+        
+        # Save to CSV
+        df.to_csv(filename, index=False)
+        print(f"\n✓ Comprehensive results saved to: {filename}")
+        
+        # Display summary statistics
+        print(f"\nSUMMARY STATISTICS:")
+        print(f"Total experiments: {len(df)}")
+        print(f"Group comparisons: {df['group_comparison'].unique()}")
+        print(f"Methods tested: {df['method'].unique()}")
+        
+        # Best results per group
+        print(f"\nBEST ACCURACY PER GROUP:")
+        for group in df['group_comparison'].unique():
+            group_data = df[df['group_comparison'] == group]
+            best_row = group_data.loc[group_data['accuracy'].idxmax()]
+            print(f"  {group}: {best_row['accuracy']:.3f} ({best_row['method']})")
+        
+        return filename
+
+    def load_eeg_data(self, subject_id):
+        """Load EEG data for a subject with multiple path attempts"""
+        potential_paths = [
+            os.path.join(self.data_path, f"sub-{subject_id:03d}", 
+                        "eeg", f"sub-{subject_id:03d}_task-eyesclosed_eeg.set"),
+            os.path.join(self.data_path, f"subject_{subject_id}.set"),
+            os.path.join(self.data_path, f"patient_{subject_id}_eeg.set"),
+            os.path.join(self.data_path, f"sub-{subject_id:03d}.set"),
+            os.path.join(self.data_path, f"sub-{subject_id:03d}", f"sub-{subject_id:03d}.set")
+        ]
+        
+        for file_path in potential_paths:
+            try:
+                if os.path.exists(file_path):
+                    raw = mne.io.read_raw_eeglab(file_path, preload=True, verbose=False)
+                    raw.pick("eeg")
+                    if raw.info['bads']:
+                        raw.drop_channels(raw.info['bads'])
+                    return raw.get_data(), raw.info['sfreq'], raw.ch_names
+            except Exception:
+                continue
+        
+        return None, None, None
+    
+    def create_multi_channel_spectrograms(self, eeg_data, ch_names, sfreq):
+        """
+        Create multi-channel spectrograms for automatic feature learning
+        Each channel becomes a separate channel in the spectrogram for CNN processing
+        
+        Enhanced with:
+        - Better frequency resolution
+        - Improved normalization
+        - Automatic feature learning optimization
+        """
+        n_channels, n_samples = eeg_data.shape
+        window_samples = int(self.window_length * sfreq)
+        step_samples = int(window_samples * (1 - self.overlap))
+        
+        if n_samples < window_samples:
+            return np.array([])
+        
+        # Adaptive parameters for better time-frequency representation
+        nperseg = min(self.nperseg, window_samples // 3)  # Better frequency resolution
+        noverlap = int(nperseg * 0.8)  # Higher overlap for smoother spectrograms
+        
+        multi_channel_spectrograms = []
+        
+        for start in range(0, n_samples - window_samples + 1, step_samples):
+            window_data = eeg_data[:, start:start + window_samples]
+            # Enhanced preprocessing: remove DC and apply detrending
+            window_data = signal.detrend(window_data, axis=1, type='linear')
+            window_data = window_data - np.mean(window_data, axis=1, keepdims=True)
+            
+            channel_spectrograms = []
+            
+            for ch_idx, ch_name in enumerate(ch_names):
+                try:
+                    # Create high-quality spectrogram for automatic feature learning
+                    f, t, Sxx = signal.spectrogram(
+                        window_data[ch_idx], 
+                        fs=sfreq,
+                        nperseg=nperseg,
+                        noverlap=noverlap,
+                        detrend='constant',
+                        scaling='density'  # Better for CNN input
+                    )
+                    
+                    # Filter to relevant frequency range
+                    freq_mask = (f >= self.freq_min) & (f <= self.freq_max)
+                    Sxx_filtered = Sxx[freq_mask, :]
+                    
+                    if Sxx_filtered.size == 0:
+                        continue
+                    
+                    # Enhanced normalization for CNN input
+                    # Log transform for better dynamic range
+                    Sxx_db = 10 * np.log10(Sxx_filtered + 1e-12)
+                    
+                    # Robust normalization using percentiles
+                    p5, p95 = np.percentile(Sxx_db, [5, 95])
+                    Sxx_norm = np.clip((Sxx_db - p5) / (p95 - p5 + 1e-10), 0, 1)
+                    
+                    channel_spectrograms.append(Sxx_norm)
+                    
+                except Exception as e:
+                    continue
+            
+            if len(channel_spectrograms) > 0:
+                # Stack channels as the last dimension (freq, time, channels) for CNN
+                multi_channel_spec = np.stack(channel_spectrograms, axis=-1)
+                # Ensure minimum size for CNN processing
+                if multi_channel_spec.shape[0] > 4 and multi_channel_spec.shape[1] > 4:
+                    multi_channel_spectrograms.append(multi_channel_spec)
+        
+        return np.array(multi_channel_spectrograms)
+    
+    def create_spatial_spectrograms(self, eeg_data, ch_names, sfreq):
+        """
+        Create spatial arrangement spectrograms with enhanced electrode positioning
+        Maps electrodes to their spatial positions for spatial feature learning
+        
+        Enhanced with:
+        - Improved spatial interpolation
+        - Better handling of missing electrodes
+        - Spatial smoothing for CNN input
+        """
+        n_channels, n_samples = eeg_data.shape
+        window_samples = int(self.window_length * sfreq)
+        step_samples = int(window_samples * (1 - self.overlap))
+        
+        if n_samples < window_samples:
+            return np.array([])
+        
+        # Enhanced parameters for spatial representation
+        nperseg = min(self.nperseg, window_samples // 3)
+        noverlap = int(nperseg * 0.8)
+        
+        spatial_spectrograms = []
+        
+        for start in range(0, n_samples - window_samples + 1, step_samples):
+            window_data = eeg_data[:, start:start + window_samples]
+            window_data = signal.detrend(window_data, axis=1, type='linear')
+            window_data = window_data - np.mean(window_data, axis=1, keepdims=True)
+            
+            spatial_grid = None
+            valid_channels = 0
+            
+            for ch_idx, ch_name in enumerate(ch_names):
+                if ch_name in self.electrode_positions:
+                    try:
+                        # Create high-quality spectrogram
+                        f, t, Sxx = signal.spectrogram(
+                            window_data[ch_idx], 
+                            fs=sfreq,
+                            nperseg=nperseg,
+                            noverlap=noverlap,
+                            detrend='constant',
+                            scaling='density'
+                        )
+                        
+                        # Filter frequencies
+                        freq_mask = (f >= self.freq_min) & (f <= self.freq_max)
+                        Sxx_filtered = Sxx[freq_mask, :]
+                        
+                        if Sxx_filtered.size == 0:
+                            continue
+                        
+                        # Enhanced normalization
+                        Sxx_db = 10 * np.log10(Sxx_filtered + 1e-12)
+                        p5, p95 = np.percentile(Sxx_db, [5, 95])
+                        Sxx_norm = np.clip((Sxx_db - p5) / (p95 - p5 + 1e-10), 0, 1)
+                        
+                        # Place in spatial grid
+                        row, col = self.electrode_positions[ch_name]
+                        if spatial_grid is None:
+                            # Initialize spatial grid (rows, cols, freq, time)
+                            spatial_grid = np.zeros((*self.spatial_grid_size, 
+                                                   Sxx_norm.shape[0], Sxx_norm.shape[1]))
+                        
+                        spatial_grid[row, col, :, :] = Sxx_norm
+                        valid_channels += 1
+                        
+                    except Exception as e:
+                        continue
+            
+            # Only include if we have sufficient electrode coverage
+            if spatial_grid is not None and valid_channels >= 8:  # Minimum electrode requirement
+                # Apply light spatial smoothing to help with missing electrodes
+                from scipy.ndimage import gaussian_filter
+                for freq_idx in range(spatial_grid.shape[2]):
+                    for time_idx in range(spatial_grid.shape[3]):
+                        spatial_slice = spatial_grid[:, :, freq_idx, time_idx]
+                        if np.sum(spatial_slice > 0) > 0:  # Only smooth if data exists
+                            spatial_grid[:, :, freq_idx, time_idx] = gaussian_filter(
+                                spatial_slice, sigma=0.5, mode='constant'
+                            )
+                
+                # Reshape to (freq, time, spatial_channels) format for CNN
+                spatial_flat = spatial_grid.reshape(
+                    spatial_grid.shape[2], spatial_grid.shape[3], -1
+                )
+                
+                if spatial_flat.shape[0] > 4 and spatial_flat.shape[1] > 4:
+                    spatial_spectrograms.append(spatial_flat)
+        
+        return np.array(spatial_spectrograms)
+    
+    def extract_all_representations(self, classification_task='advscn', 
+                                  max_windows_per_subject=100,
+                                  methods=['multi_channel', 'spatial']):
+        """
+        Extract multiple representation methods for all subjects
+        """
+        try:
+            participants = pd.read_csv(self.participants_file, sep='\t')
+        except Exception as e:
+            raise ValueError(f"Error reading participants file: {e}")
+        
+        # Define classification tasks
+        task_mapping = {
+            'advsftd': ['A', 'F'],        # AD vs FTD
+            'advscn': ['A', 'C'],         # AD vs Control  
+            'ftdvscn': ['F', 'C'],        # FTD vs Control
+            'advsftdvscn': ['A', 'F', 'C'], # AD vs FTD vs Control (3-class)
+        }
+        
+        if classification_task not in task_mapping:
+            raise ValueError(f"Invalid classification task: {classification_task}")
+        
+        self.classification_task = classification_task
+        target_groups = task_mapping[classification_task]
+        filtered_participants = participants[participants['Group'].isin(target_groups)]
+        
+        print(f"Processing {classification_task}: {len(filtered_participants)} participants")
+        
+        # Initialize storage for different methods
+        all_data = {}
+        for method in methods:
+            all_data[method] = {
+                'X': [],
+                'y': [],
+                'subject_ids': []
+            }
+        
+        successful_subjects = 0
+        
+        # Process each subject
+        for _, row in tqdm(filtered_participants.iterrows(), 
+                          total=len(filtered_participants), desc="Processing subjects"):
+            try:
+                subject_id = int(row['participant_id'].split('-')[1])
+                group = row['Group']
+                
+                # Load EEG data
+                eeg_data, sfreq, ch_names = self.load_eeg_data(subject_id)
+                if eeg_data is not None and ch_names is not None:
+                    
+                    # Extract different representations
+                    if 'multi_channel' in methods:
+                        multi_ch = self.create_multi_channel_spectrograms(eeg_data, ch_names, sfreq)
+                        if len(multi_ch) > 0:
+                            n_windows = min(len(multi_ch), max_windows_per_subject)
+                            indices = np.random.choice(len(multi_ch), n_windows, replace=False)
+                            all_data['multi_channel']['X'].extend(multi_ch[indices])
+                            all_data['multi_channel']['y'].extend([group] * n_windows)
+                            all_data['multi_channel']['subject_ids'].extend([subject_id] * n_windows)
+                    
+                    if 'spatial' in methods:
+                        spatial = self.create_spatial_spectrograms(eeg_data, ch_names, sfreq)
+                        if len(spatial) > 0:
+                            n_windows = min(len(spatial), max_windows_per_subject)
+                            indices = np.random.choice(len(spatial), n_windows, replace=False)
+                            all_data['spatial']['X'].extend(spatial[indices])
+                            all_data['spatial']['y'].extend([group] * n_windows)
+                            all_data['spatial']['subject_ids'].extend([subject_id] * n_windows)
+                    
+                    successful_subjects += 1
+                
+            except Exception as e:
+                print(f"Warning: Error processing subject {subject_id}: {e}")
+                continue
+        
+        # Convert to arrays and encode labels
+        processed_data = {}
+        for method in methods:
+            if len(all_data[method]['X']) > 0:
+                X = np.array(all_data[method]['X'])
+                y = self.label_encoder.fit_transform(all_data[method]['y'])
+                subject_ids = all_data[method]['subject_ids']
+                
+                processed_data[method] = {
+                    'X': X,
+                    'y': y,
+                    'subject_ids': subject_ids
+                }
+                
+                print(f"{method}: {X.shape[0]} samples, shape: {X.shape}")
+            else:
+                print(f"{method}: No data extracted")
+        
+        return processed_data
+    
+    def build_basic_2d_cnn(self, input_shape, num_classes):
+        """
+        Build enhanced basic 2D CNN architecture for automatic feature learning
+        Optimized for spectrogram input with proper feature extraction hierarchy
+        """
+        model = Sequential([
+            # First convolutional block - Low-level feature extraction
+            Conv2D(32, (3, 3), padding='same', input_shape=input_shape,
+                   kernel_initializer='he_normal', name='conv1_1'),
+            BatchNormalization(name='bn1_1'),
+            Activation('relu', name='relu1_1'),
+            Conv2D(32, (3, 3), padding='same', 
+                   kernel_initializer='he_normal', name='conv1_2'),
+            BatchNormalization(name='bn1_2'),
+            Activation('relu', name='relu1_2'),
+            MaxPooling2D((2, 2), name='pool1'),
+            Dropout(0.25, name='dropout1'),
+            
+            # Second convolutional block - Mid-level features
+            Conv2D(64, (3, 3), padding='same', 
+                   kernel_initializer='he_normal', name='conv2_1'),
+            BatchNormalization(name='bn2_1'),
+            Activation('relu', name='relu2_1'),
+            Conv2D(64, (3, 3), padding='same', 
+                   kernel_initializer='he_normal', name='conv2_2'),
+            BatchNormalization(name='bn2_2'),
+            Activation('relu', name='relu2_2'),
+            MaxPooling2D((2, 2), name='pool2'),
+            Dropout(0.3, name='dropout2'),
+            
+            # Third convolutional block - High-level features
+            Conv2D(128, (3, 3), padding='same', 
+                   kernel_initializer='he_normal', name='conv3_1'),
+            BatchNormalization(name='bn3_1'),
+            Activation('relu', name='relu3_1'),
+            Conv2D(128, (3, 3), padding='same', 
+                   kernel_initializer='he_normal', name='conv3_2'),
+            BatchNormalization(name='bn3_2'),
+            Activation('relu', name='relu3_2'),
+            MaxPooling2D((2, 2), name='pool3'),
+            Dropout(0.3, name='dropout3'),
+            
+            # Global pooling for automatic feature aggregation
+            GlobalAveragePooling2D(name='global_avg_pool'),
+            
+            # Dense layers for final classification
+            Dense(256, kernel_initializer='he_normal', 
+                  kernel_regularizer=l2(0.001), name='dense1'),
+            BatchNormalization(name='bn_dense1'),
+            Activation('relu', name='relu_dense1'),
+            Dropout(0.5, name='dropout_dense1'),
+            
+            Dense(128, kernel_initializer='he_normal', 
+                  kernel_regularizer=l2(0.001), name='dense2'),
+            BatchNormalization(name='bn_dense2'),
+            Activation('relu', name='relu_dense2'),
+            Dropout(0.5, name='dropout_dense2'),
+            
+            # Output layer
+            Dense(1 if num_classes == 2 else num_classes, 
+                  activation='sigmoid' if num_classes == 2 else 'softmax',
+                  kernel_initializer='glorot_normal', name='output')
+        ])
+        
+        return model
+    
+    def prepare_data_with_subject_split(self, data_dict, method, test_size=0.2, val_size=0.1, 
+                                      random_state=42):
+        """Prepare train/validation/test splits ensuring no subject overlap"""
+        if method not in data_dict:
+            raise ValueError(f"Method {method} not found in data")
+        
+        X = data_dict[method]['X']
+        y = data_dict[method]['y']
+        subject_ids = data_dict[method]['subject_ids']
+        
+        unique_subjects = np.unique(subject_ids)
+        subject_labels = []
+        
+        for subj in unique_subjects:
+            mask = np.array(subject_ids) == subj
+            label = y[mask][0]
+            subject_labels.append(label)
+        
+        subject_labels = np.array(subject_labels)
+        
+        # Split subjects first
+        subjects_train, subjects_test, _, _ = train_test_split(
+            unique_subjects, subject_labels, test_size=test_size,
+            stratify=subject_labels, random_state=random_state
+        )
+        
+        subjects_train, subjects_val, _, _ = train_test_split(
+            subjects_train, subject_labels[:len(subjects_train)], 
+            test_size=val_size/(1-test_size),
+            stratify=subject_labels[:len(subjects_train)], random_state=random_state
+        )
+        
+        # Create data splits
+        def get_data_for_subjects(subject_list):
+            mask = np.isin(subject_ids, subject_list)
+            return X[mask], y[mask], np.array(subject_ids)[mask]
+        
+        X_train, y_train, train_subject_ids = get_data_for_subjects(subjects_train)
+        X_val, y_val, val_subject_ids = get_data_for_subjects(subjects_val)
+        X_test, y_test, test_subject_ids = get_data_for_subjects(subjects_test)
+        
+        return (X_train, y_train), (X_val, y_val), (X_test, y_test, test_subject_ids)
+    
+    def train_model(self, X_train, y_train, X_val, y_val, epochs=100, batch_size=32,
+                   architecture='basic'):
+        """Train 2D CNN model with enhanced training procedure"""
+        num_classes = len(np.unique(np.concatenate([y_train, y_val])))
+        
+        # Convert labels for multi-class
+        if num_classes > 2:
+            y_train = to_categorical(y_train, num_classes)
+            y_val = to_categorical(y_val, num_classes)
+        
+        # Build model based on architecture type
+        self.model = self.build_basic_2d_cnn(X_train.shape[1:], num_classes)
+        
+        # Enhanced optimizer with learning rate scheduling
+        initial_lr = 0.001
+        optimizer = Adam(learning_rate=initial_lr)
+        
+        # Compile model with appropriate loss function
+        if num_classes == 2:
+            self.model.compile(
+                optimizer=optimizer,
+                loss='binary_crossentropy',
+                metrics=['accuracy']
+            )
+        else:
+            self.model.compile(
+                optimizer=optimizer,
+                loss='categorical_crossentropy',
+                metrics=['accuracy']
+            )
+        
+        # Calculate class weights for balanced training
+        if num_classes == 2:
+            y_for_weights = y_train
+        else:
+            y_for_weights = np.argmax(y_train, axis=1)
+        
+        class_weights = compute_class_weight('balanced', 
+                                           classes=np.unique(y_for_weights), 
+                                           y=y_for_weights)
+        class_weight_dict = dict(enumerate(class_weights))
+        
+        # Enhanced callbacks for better training
+        callbacks = [
+            EarlyStopping(
+                patience=25,  # Increased patience for better convergence
+                restore_best_weights=True,
+                monitor='val_accuracy',
+                verbose=0,
+                mode='max'
+            ),
+            ReduceLROnPlateau(
+                patience=15,  # Reduce learning rate more aggressively
+                factor=0.5,
+                min_lr=1e-7,
+                monitor='val_loss',
+                verbose=0,
+                mode='min'
+            )
+        ]
+        
+        # Train model with enhanced parameters
+        history = self.model.fit(
+            X_train, y_train,
+            validation_data=(X_val, y_val),
+            epochs=epochs,
+            batch_size=batch_size,
+            class_weight=class_weight_dict,
+            callbacks=callbacks,
+            verbose=0,
+            shuffle=True
+        )
+        
+        return history
+    
+    def evaluate_model(self, X_test, y_test, test_subject_ids=None):
+        """Evaluate model performance with the requested metrics"""
+        if self.model is None:
+            raise ValueError("Model not trained yet!")
+        
+        y_pred_proba = self.model.predict(X_test, verbose=0)
+        num_classes = len(self.label_encoder.classes_)
+        
+        if num_classes == 2:
+            y_pred_classes = (y_pred_proba > 0.5).astype(int).flatten()
+            y_pred_proba_for_metrics = y_pred_proba.flatten()
+        else:
+            y_pred_classes = np.argmax(y_pred_proba, axis=1)
+            y_test = np.argmax(y_test, axis=1) if y_test.ndim > 1 else y_test
+            # For multi-class AUC calculation, we need the full probability matrix
+            y_pred_proba_for_metrics = y_pred_proba
+        
+        # Calculate the requested metrics using the enhanced function
+        metrics = self.calculate_comprehensive_metrics(
+            y_test, y_pred_classes, y_pred_proba_for_metrics
+        )
+        
+        # Add additional information
+        metrics.update({
+            'predictions': y_pred_classes,
+            'prediction_probabilities': y_pred_proba_for_metrics,
+            'test_subject_ids': test_subject_ids,
+            'y_true': y_test
+        })
+        
+        return metrics
+    
+    def store_results_for_csv(self, classification_task, method_name, metrics, history, architecture):
+        """Store results in the format needed for comprehensive CSV with requested metrics only"""
+        class_names = self.label_encoder.classes_
+        
+        # Get training info
+        best_epoch = np.argmin(history.history['val_loss']) + 1
+        final_train_loss = history.history['loss'][-1]
+        final_val_loss = history.history['val_loss'][-1]
+        
+        # Create row data with only the requested metrics
+        row_data = {
+            'group_comparison': classification_task,
+            'method': method_name,
+            'architecture': architecture,
+            'accuracy': metrics['accuracy'],
+            'balanced_accuracy': metrics['balanced_accuracy'],
+            'specificity': metrics['specificity'],
+            'f1_score': metrics['f1_score'],
+            'auc': metrics['auc'],
+            'best_epoch': best_epoch,
+            'final_train_loss': final_train_loss,
+            'final_val_loss': final_val_loss,
+            'window_length': self.window_length,
+            'overlap': self.overlap,
+            'n_test_samples': len(metrics['test_subject_ids']) if metrics['test_subject_ids'] is not None else 0
+        }
+        
+        # Add confusion matrix elements for binary classification
+        if len(class_names) == 2:
+            cm = metrics['confusion_matrix']
+            row_data.update({
+                'true_negative': cm[0, 0],
+                'false_positive': cm[0, 1],
+                'false_negative': cm[1, 0],
+                'true_positive': cm[1, 1]
+            })
+        
+        self.all_results_data.append(row_data)
+    
+    def run_group_comparison(self, classification_task='advscn',
+                           methods=['multi_channel', 'spatial'],
+                           max_windows_per_subject=100,
+                           epochs=100, batch_size=32):
+        """
+        Run classification for a specific group comparison
+        """
+        # Get group names for display
+        task_names = {
+            'advsftd': 'AD vs FTD',
+            'advscn': 'AD vs Control',
+            'ftdvscn': 'FTD vs Control',
+            'advsftdvscn': 'AD vs FTD vs Control'
+        }
+        
+        task_descriptions = {
+            'advsftd': 'Alzheimer\'s Disease (AD) vs Frontotemporal Dementia (FTD)',
+            'advscn': 'Alzheimer\'s Disease (AD) vs Control',
+            'ftdvscn': 'Frontotemporal Dementia (FTD) vs Control',
+            'advsftdvscn': 'AD vs FTD vs Control (3-class)'
+        }
+        
+        group_name = task_names.get(classification_task, classification_task)
+        task_description = task_descriptions.get(classification_task, classification_task)
+        
+        print(f"\n=== {group_name} | BASIC 2D CNN Architecture ===")
+        
+        method_results = {}
+        
+        try:
+            # Extract data
+            all_data = self.extract_all_representations(
+                classification_task=classification_task,
+                max_windows_per_subject=max_windows_per_subject,
+                methods=methods
+            )
+            
+            # Process each method
+            for method in methods:
+                if method in all_data and len(all_data[method]['X']) > 0:
+                    print(f"\nMethod: {method}")
+                    
+                    # Prepare data
+                    (X_train, y_train), (X_val, y_val), (X_test, y_test, test_subject_ids) = \
+                        self.prepare_data_with_subject_split(all_data, method)
+                    
+                    print(f"  Training samples: {len(X_train)}")
+                    print(f"  Validation samples: {len(X_val)}")
+                    print(f"  Test samples: {len(X_test)}")
+                    
+                    # Train
+                    print("  Training...", end="")
+                    history = self.train_model(
+                        X_train, y_train, X_val, y_val,
+                        epochs=epochs,
+                        batch_size=batch_size,
+                        architecture='basic'
+                    )
+                    print(" Done")
+                    
+                    # Evaluate
+                    print("  Evaluating...", end="")
+                    metrics = self.evaluate_model(X_test, y_test, test_subject_ids)
+                    print(" Done")
+                    
+                    method_results[method] = {
+                        'results': metrics,
+                        'history': history,
+                        'architecture': 'basic'
+                    }
+                    
+                    # Store results for comprehensive CSV
+                    self.store_results_for_csv(classification_task, method, metrics, history, 'basic')
+                    
+                    # Display results with only the requested metrics
+                    print(f"  Results:")
+                    print(f"    Accuracy: {metrics['accuracy']:.3f}")
+                    print(f"    Balanced Accuracy: {metrics['balanced_accuracy']:.3f}")
+                    print(f"    Specificity: {metrics['specificity']:.3f}")
+                    print(f"    F1-Score: {metrics['f1_score']:.3f}")
+                    if not np.isnan(metrics['auc']):
+                        print(f"    AUC: {metrics['auc']:.3f}")
+                    else:
+                        print(f"    AUC: N/A")
+                    
+                    # Generate plots
+                    class_names = self.label_encoder.classes_
+                    
+                    # Create safe filenames
+                    safe_task_name = classification_task.replace('/', '_')
+                    safe_method_name = method.replace('/', '_')
+                    
+                    base_filename = f"{safe_task_name}_{safe_method_name}"
+                    
+                    # Plot confusion matrix
+                    cm_path = os.path.join('confusion_matrices', f'{base_filename}_confusion_matrix.png')
+                    self.plot_confusion_matrix(metrics['confusion_matrix'], class_names, 
+                                             task_description, method, cm_path)
+                    
+                    # Plot ROC curve (for both binary and multi-class classification)
+                    roc_path = os.path.join('roc_curves', f'{base_filename}_roc_curve.png')
+                    self.plot_roc_curve(metrics['y_true'], metrics['prediction_probabilities'], 
+                                      task_description, method, class_names, roc_path)
+            
+            # Display summary in code 2 format
+            if method_results:
+                print(f"\n--- SUMMARY FOR {group_name} ---")
+                best_method = None
+                best_acc = 0
+                
+                for method_name, data in method_results.items():
+                    acc = data['results']['accuracy']
+                    if acc > best_acc:
+                        best_acc = acc
+                        best_method = method_name
+                    print(f"{method_name}: {acc:.1%}")
+                
+                print(f"Best: {best_method} ({best_acc:.1%})")
+            
+            return method_results
+            
+        except Exception as e:
+            print(f"Error in {group_name}: {str(e)}")
+            return None
+
+
+def run_all_experiments():
+    """Run all experiments and save comprehensive results"""
+    DATA_PATH = "derivatives"
+    PARTICIPANTS_FILE = "participants.tsv"
+    
+    # All tasks including 3-class
+    TASKS = ['advscn', 'advsftd', 'ftdvscn', 'advsftdvscn']
+    METHODS = ['multi_channel', 'spatial']
+    
+    print("Basic 2D CNN EEG Classification - Comprehensive Analysis")
+    print("=" * 70)
+    
+    # Create classifier instance that will accumulate all results
+    classifier = Basic2DCNN(
+        data_path=DATA_PATH,
+        participants_file=PARTICIPANTS_FILE,
+        window_length=2.0,  # 2-second windows
+        overlap=0.5         # 50% overlap
+    )
+    
+    all_results = {}
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    for task in TASKS:
+        try:
+            results = classifier.run_group_comparison(
+                classification_task=task,
+                methods=METHODS,
+                max_windows_per_subject=100,
+                epochs=100,
+                batch_size=32
+            )
+            
+            if results:
+                all_results[task] = results
+            
+        except Exception as e:
+            print(f"Error with {task}: {e}")
+            continue
+    
+    # Save comprehensive CSV with all results
+    csv_filename = classifier.save_comprehensive_results_csv(timestamp)
+    
+    # Final summary table with requested metrics only
+    print(f"\n{'='*90}")
+    print("COMPREHENSIVE RESULTS SUMMARY")
+    print(f"{'='*90}")
+    print(f"{'Group':<20} {'Method':<15} {'Acc':<6} {'Bal.Acc':<8} {'Spec':<6} {'F1':<6} {'AUC':<6}")
+    print(f"{'-'*90}")
+    
+    task_names = {
+        'advscn': 'AD vs Control',
+        'advsftd': 'AD vs FTD', 
+        'ftdvscn': 'FTD vs Control',
+        'advsftdvscn': 'AD vs FTD vs CN'
+    }
+    
+    for task, task_data in all_results.items():
+        group_name = task_names.get(task, task)
+        
+        for method_name, data in task_data.items():
+            if 'results' in data:
+                r = data['results']
+                auc_str = f"{r['auc']:.3f}" if not np.isnan(r['auc']) else "N/A"
+                
+                print(f"{group_name:<20} {method_name:<15} {r['accuracy']:.3f} "
+                      f"{r['balanced_accuracy']:.3f}   {r['specificity']:.3f} "
+                      f"{r['f1_score']:.3f} {auc_str:<6}")
+    
+    print(f"{'-'*90}")
+    print("METRICS EXPLANATION:")
+    print(" Accuracy: Overall percentage of correct predictions")
+    print(" Balanced Accuracy: Average of recall obtained on each class, useful for imbalanced datasets")  
+    print(" Specificity: True negative rate; ability to correctly identify negative cases")
+    print(" F1-Score: Harmonic mean of Precision and Recall, balancing both metrics")
+    print(" AUC: Area Under the Curve - aggregate measure of performance across all thresholds")
+    print("      For multi-class: macro-averaged one-vs-rest AUC")
+    print(f"\n✓ Comprehensive results saved to: {csv_filename}")
+    print("✓ Confusion matrices saved in confusion_matrices/ directory")
+    print("✓ ROC curves saved in roc_curves/ directory")
+    
+    return all_results, csv_filename
+
+
+def quick_test():
+    """Quick test with AD vs Control only"""
+    print("Quick Test: AD vs Control")
+    
+    classifier = Basic2DCNN(
+        data_path="derivatives",
+        participants_file="participants.tsv",
+        window_length=2.0,  # 2-second windows
+        overlap=0.5         # 50% overlap
+    )
+    
+    results = classifier.run_group_comparison(
+        classification_task='advscn',  # AD vs Control
+        methods=['multi_channel', 'spatial'],
+        max_windows_per_subject=50,
+        epochs=50,
+        batch_size=32
+    )
+    
+    # Save quick test results
+    if results:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_filename = classifier.save_comprehensive_results_csv(timestamp)
+        print(f"\nQuick test results saved to: {csv_filename}")
+    
+    return results
+
+
+if __name__ == "__main__":
+    # Set seeds for reproducibility
+    np.random.seed(42)
+    tf.random.set_seed(42)
+    
+    print("Basic 2D CNN for EEG Spectrograms - Enhanced with Multi-class AUC")
+    print("=" * 80)
+    
+    # Run quick test first
+    print("Running quick test...")
+    try:
+        test_results = quick_test()
+        if test_results:
+            print("✓ Quick test successful!")
+            
+            # Ask user if they want to run full experiments
+            print("\nRun full experiments on all groups? (This will take longer)")
+            print("Full experiments will include:")
+            print("- AD vs Control")
+            print("- AD vs FTD") 
+            print("- FTD vs Control")
+            print("- AD vs FTD vs Control (3-class)")
+            
+            # For automated execution, run full experiments
+            print("\nRunning full experiments...")
+            all_results, csv_file = run_all_experiments()
+            
+        else:
+            print("✗ Quick test failed")
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
