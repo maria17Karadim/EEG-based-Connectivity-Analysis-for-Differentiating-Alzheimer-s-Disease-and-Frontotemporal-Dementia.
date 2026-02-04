@@ -1,0 +1,1158 @@
+import pandas as pd
+import numpy as np
+from sklearn.svm import SVC
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.naive_bayes import GaussianNB
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
+from sklearn.model_selection import LeaveOneOut, StratifiedKFold
+from sklearn.metrics import (accuracy_score, precision_score, recall_score, 
+                            f1_score, confusion_matrix, roc_auc_score, balanced_accuracy_score,
+                            roc_curve, auc, classification_report)
+from sklearn.feature_selection import (SelectKBest, f_classif, SelectPercentile, 
+                                     RFE, SelectFromModel, mutual_info_classif,
+                                     VarianceThreshold)
+from sklearn.decomposition import PCA, FastICA
+from sklearn.manifold import TSNE
+from sklearn.cluster import FeatureAgglomeration
+from sklearn.linear_model import LogisticRegression
+from sklearn.utils import resample
+from sklearn.pipeline import Pipeline
+from sklearn.multiclass import OneVsRestClassifier
+from sklearn.preprocessing import label_binarize
+import warnings
+import time
+from collections import defaultdict
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.calibration import calibration_curve
+from itertools import cycle
+import os
+
+warnings.filterwarnings('ignore')
+
+# Set plotting style
+plt.style.use('default')
+sns.set_palette("husl")
+
+# Create directories for saving plots
+os.makedirs('confusion_matrices', exist_ok=True)
+os.makedirs('roc_curves', exist_ok=True)
+os.makedirs('calibration_plots', exist_ok=True)
+
+# Load the features
+print("Loading features...")
+df = pd.read_csv("EEG_channelwise_features.csv")
+
+# Define classification tasks (including multi-class)
+classification_tasks = {
+    'A_vs_F': ['A', 'F'],  # AD vs FTD
+    'A_vs_C': ['A', 'C'],  # AD vs Control
+    'C_vs_F': ['C', 'F'],  # Control vs FTD
+    'AD_vs_FTD_vs_CN': ['A', 'F', 'C']  # All three classes together
+}
+
+# Define classifiers with better hyperparameters
+classifiers = {
+    'SVM_Linear': SVC(kernel='linear', probability=True, random_state=42, C=1.0, class_weight='balanced'),
+    'SVM_RBF': SVC(kernel='rbf', probability=True, random_state=42, C=1.0, gamma='scale', class_weight='balanced'),
+    'LDA': LinearDiscriminantAnalysis(solver='lsqr', shrinkage='auto'),
+    'Naive_Bayes': GaussianNB(var_smoothing=1e-8),
+    'Random_Forest': RandomForestClassifier(n_estimators=200, random_state=42, class_weight='balanced', 
+                                          max_depth=5, min_samples_split=5, min_samples_leaf=2)
+}
+
+# Define scalers
+scalers = {
+    'RobustScaler': RobustScaler()
+}
+
+# Define dimensionality reduction methods with better parameters
+def get_dim_reduction_methods(n_features, n_samples):
+    max_components = min(50, n_features//2, n_samples-2)
+    return {
+        'None': None,
+        'VarianceThreshold': VarianceThreshold(threshold=0.01),
+        'SelectKBest_F': SelectKBest(f_classif, k=min(max_components, n_features)),
+        'SelectKBest_MI': SelectKBest(mutual_info_classif, k=min(max_components, n_features)),
+        'PCA_95': PCA(n_components=0.95, random_state=42),
+    }
+
+def calculate_specificity(y_true, y_pred, pos_label=1):
+    """
+    Calculate specificity (True Negative Rate) for binary and multi-class classification
+    """
+    cm = confusion_matrix(y_true, y_pred)
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    else:
+        # For multi-class, calculate average specificity
+        specificities = []
+        for i in range(cm.shape[0]):
+            tp = cm[i, i]
+            fn = np.sum(cm[i, :]) - tp
+            fp = np.sum(cm[:, i]) - tp
+            tn = np.sum(cm) - tp - fn - fp
+            
+            spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+            specificities.append(spec)
+        
+        specificity = np.mean(specificities)
+    
+    return specificity
+
+def plot_confusion_matrix(cm, class_names, task_name, classifier_name, dim_reduction, scaler, agg_method, save_path=None):
+    """
+    Plot and save confusion matrix with enhanced visualization for both binary and multi-class
+    """
+    plt.figure(figsize=(8, 6))
+    
+    # Normalize confusion matrix
+    cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+    
+    # Create subplot for both raw and normalized
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # Raw confusion matrix
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax1,
+                xticklabels=class_names, yticklabels=class_names)
+    ax1.set_title(f'Confusion Matrix (Raw Counts)\n{task_name}')
+    ax1.set_ylabel('True Label')
+    ax1.set_xlabel('Predicted Label')
+    
+    # Normalized confusion matrix
+    sns.heatmap(cm_normalized, annot=True, fmt='.3f', cmap='Blues', ax=ax2,
+                xticklabels=class_names, yticklabels=class_names)
+    ax2.set_title(f'Confusion Matrix (Normalized)\n{task_name}')
+    ax2.set_ylabel('True Label')
+    ax2.set_xlabel('Predicted Label')
+    
+    # Add configuration info
+    config_text = f'Classifier: {classifier_name}\nDim Reduction: {dim_reduction}\nScaler: {scaler}\nAggregation: {agg_method}'
+    fig.suptitle(f'{task_name} - {classifier_name}\n{config_text}', fontsize=12, y=0.95)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"    Confusion matrix saved: {save_path}")
+    
+    plt.close()
+
+def plot_roc_curve_multiclass_fixed(y_true, y_pred_proba, task_name, classifier_name, 
+                                   dim_reduction, scaler, agg_method, class_names, save_path=None):
+    """
+    FIXED ROC curve plotting function for both binary and multi-class classification
+    """
+    try:
+        plt.figure(figsize=(10, 8))
+        
+        # Convert to numpy arrays and ensure proper format
+        y_true = np.array(y_true)
+        y_pred_proba = np.array(y_pred_proba)
+        
+        print(f"    ROC Debug: y_true shape: {y_true.shape}, unique: {np.unique(y_true)}")
+        print(f"    ROC Debug: y_pred_proba shape: {y_pred_proba.shape}")
+        
+        n_classes = len(class_names)
+        unique_labels = np.unique(y_true)
+        
+        # Handle different probability matrix shapes
+        if y_pred_proba.ndim == 1:
+            if n_classes == 2:
+                y_pred_proba = np.column_stack([1 - y_pred_proba, y_pred_proba])
+            else:
+                print("    Warning: 1D probabilities with >2 classes")
+                plt.text(0.5, 0.5, 'Cannot plot ROC:\nInvalid probability format', 
+                        ha='center', va='center', transform=plt.gca().transAxes, fontsize=14)
+                plt.xlim([0, 1])
+                plt.ylim([0, 1])
+                plt.xlabel('False Positive Rate')
+                plt.ylabel('True Positive Rate')
+                plt.title(f'ROC Curve - {task_name}\n{classifier_name} (Error)')
+                if save_path:
+                    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                plt.close()
+                return np.nan
+        
+        final_auc = np.nan
+        
+        if len(unique_labels) == 2:
+            # Binary classification - FIXED
+            try:
+                # Create proper binary mapping (0, 1)
+                label_to_binary = {unique_labels[0]: 0, unique_labels[1]: 1}
+                y_true_binary = np.array([label_to_binary[label] for label in y_true])
+                
+                # Get probabilities for positive class
+                if y_pred_proba.shape[1] >= 2:
+                    # Find which column corresponds to class 1
+                    pos_class_idx = 1 if unique_labels[1] in [1, 'F', 'C'] else 0
+                    y_scores = y_pred_proba[:, pos_class_idx]
+                else:
+                    y_scores = y_pred_proba[:, 0]
+                
+                # Calculate ROC curve
+                fpr, tpr, thresholds = roc_curve(y_true_binary, y_scores)
+                roc_auc = auc(fpr, tpr)
+                
+                # Plot ROC curve
+                plt.plot(fpr, tpr, color='darkorange', lw=3, 
+                        label=f'ROC curve (AUC = {roc_auc:.3f})')
+                plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', 
+                        label='Random Classifier')
+                
+                final_auc = roc_auc
+                
+                print(f"    Binary ROC: AUC = {roc_auc:.3f}")
+                
+            except Exception as e:
+                print(f"    Binary ROC Error: {str(e)}")
+                plt.text(0.5, 0.5, f'Binary ROC Error:\n{str(e)[:50]}...', 
+                        ha='center', va='center', transform=plt.gca().transAxes)
+                final_auc = np.nan
+                
+        else:
+            # Multi-class classification - FIXED
+            try:
+                # Ensure we have consistent class ordering
+                sorted_unique = sorted(unique_labels)
+                n_unique = len(sorted_unique)
+                
+                # Create mapping to consecutive integers
+                class_to_idx = {cls: idx for idx, cls in enumerate(sorted_unique)}
+                y_true_indexed = np.array([class_to_idx[label] for label in y_true])
+                
+                print(f"    Multiclass mapping: {class_to_idx}")
+                
+                # Binarize for OvR approach
+                y_true_bin = label_binarize(y_true_indexed, classes=list(range(n_unique)))
+                
+                # Handle single class case
+                if y_true_bin.shape[1] == 1:
+                    y_true_bin = np.hstack([1 - y_true_bin, y_true_bin])
+                
+                # Plot ROC curve for each class
+                colors = cycle(['aqua', 'darkorange', 'cornflowerblue', 'red', 'green', 'purple'])
+                roc_aucs = []
+                
+                for i, color in zip(range(min(n_unique, y_pred_proba.shape[1])), colors):
+                    if i < y_true_bin.shape[1] and i < y_pred_proba.shape[1]:
+                        try:
+                            fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_pred_proba[:, i])
+                            roc_auc = auc(fpr, tpr)
+                            roc_aucs.append(roc_auc)
+                            
+                            class_name = class_names[i] if i < len(class_names) else f'Class_{sorted_unique[i]}'
+                            plt.plot(fpr, tpr, color=color, lw=2,
+                                    label=f'{class_name} (AUC = {roc_auc:.3f})')
+                            
+                        except Exception as e:
+                            print(f"    Error for class {i}: {str(e)}")
+                            continue
+                
+                plt.plot([0, 1], [0, 1], 'k--', lw=2, label='Random Classifier')
+                
+                # Calculate average AUC
+                final_auc = np.mean(roc_aucs) if roc_aucs else np.nan
+                print(f"    Multiclass ROC: Average AUC = {final_auc:.3f}")
+                
+            except Exception as e:
+                print(f"    Multiclass ROC Error: {str(e)}")
+                plt.text(0.5, 0.5, f'Multiclass ROC Error:\n{str(e)[:50]}...', 
+                        ha='center', va='center', transform=plt.gca().transAxes)
+                final_auc = np.nan
+        
+        # Finalize plot
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate', fontsize=12)
+        plt.ylabel('True Positive Rate', fontsize=12)
+        plt.title(f'ROC Curve - {task_name}\n{classifier_name}', fontsize=14, fontweight='bold')
+        plt.legend(loc="lower right", fontsize=10)
+        
+        # Add configuration info
+        config_text = f'Dim Reduction: {dim_reduction}\nScaler: {scaler}\nAggregation: {agg_method}'
+        plt.text(0.02, 0.98, config_text, fontsize=9, 
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue", alpha=0.7),
+                verticalalignment='top', transform=plt.gca().transAxes)
+        
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"    ROC curve saved: {save_path}")
+        
+        plt.close()
+        return final_auc
+        
+    except Exception as e:
+        print(f"    Critical ROC Error: {str(e)}")
+        plt.close()
+        return np.nan
+
+def calculate_multiclass_auc_fixed(y_true, y_pred_proba):
+    """
+    FIXED AUC calculation for multi-class classification
+    """
+    try:
+        y_true = np.array(y_true)
+        
+        if y_pred_proba.ndim == 1:
+            n_classes = len(np.unique(y_true))
+            if n_classes == 2:
+                return roc_auc_score(y_true, y_pred_proba)
+            else:
+                return np.nan
+        
+        unique_labels = np.unique(y_true)
+        n_classes = len(unique_labels)
+        
+        if n_classes == 2:
+            # Binary classification
+            # Create binary mapping
+            label_to_binary = {unique_labels[0]: 0, unique_labels[1]: 1}
+            y_true_binary = np.array([label_to_binary[label] for label in y_true])
+            
+            if y_pred_proba.shape[1] >= 2:
+                return roc_auc_score(y_true_binary, y_pred_proba[:, 1])
+            else:
+                return roc_auc_score(y_true_binary, y_pred_proba[:, 0])
+        else:
+            # Multi-class classification
+            sorted_unique = sorted(unique_labels)
+            class_to_idx = {cls: idx for idx, cls in enumerate(sorted_unique)}
+            y_true_indexed = np.array([class_to_idx[label] for label in y_true])
+            
+            n_pred_classes = y_pred_proba.shape[1]
+            n_actual_classes = len(sorted_unique)
+            
+            if n_pred_classes >= n_actual_classes:
+                return roc_auc_score(y_true_indexed, y_pred_proba[:, :n_actual_classes], 
+                                   multi_class='ovr', average='weighted')
+            else:
+                return np.nan
+                
+    except Exception as e:
+        print(f"    AUC calculation error: {str(e)}")
+        return np.nan
+
+def plot_calibration_curve_multiclass(y_true, y_pred_proba, task_name, classifier_name, 
+                                     dim_reduction, scaler, agg_method, save_path=None):
+    """
+    Plot calibration curve for multi-class classification
+    """
+    try:
+        n_classes = len(np.unique(y_true))
+        
+        if n_classes == 2:
+            # Binary case
+            y_true_binary = np.array([0 if y == np.unique(y_true)[0] else 1 for y in y_true])
+            proba_pos = y_pred_proba[:, 1] if y_pred_proba.ndim > 1 else y_pred_proba
+            
+            fraction_of_positives, mean_predicted_value = calibration_curve(
+                y_true_binary, proba_pos, n_bins=5
+            )
+            
+            plt.figure(figsize=(8, 6))
+            plt.plot(mean_predicted_value, fraction_of_positives, "s-", 
+                    label=f'{classifier_name}', linewidth=2, markersize=8)
+            plt.plot([0, 1], [0, 1], "k:", label="Perfectly calibrated")
+        else:
+            # Multi-class case
+            plt.figure(figsize=(12, 8))
+            colors = cycle(['aqua', 'darkorange', 'cornflowerblue', 'red', 'green'])
+            
+            unique_labels = np.unique(y_true)
+            for i, (label, color) in enumerate(zip(unique_labels, colors)):
+                if i < y_pred_proba.shape[1]:
+                    try:
+                        y_true_binary = (y_true == label).astype(int)
+                        fraction_of_positives, mean_predicted_value = calibration_curve(
+                            y_true_binary, y_pred_proba[:, i], n_bins=3
+                        )
+                        plt.plot(mean_predicted_value, fraction_of_positives, "s-", 
+                                color=color, label=f'Class {label}', linewidth=2, markersize=8)
+                    except:
+                        continue
+            
+            plt.plot([0, 1], [0, 1], "k:", label="Perfectly calibrated")
+        
+        plt.xlabel('Mean Predicted Probability')
+        plt.ylabel('Fraction of Positives')
+        plt.title(f'Calibration Plot - {task_name}\n{classifier_name}')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        config_text = f'Dim Reduction: {dim_reduction}\nScaler: {scaler}\nAggregation: {agg_method}'
+        plt.text(0.6, 0.2, config_text, fontsize=10, 
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgreen", alpha=0.7))
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"    Calibration plot saved: {save_path}")
+        
+        plt.close()
+        
+    except Exception as e:
+        print(f"    Calibration plot error: {str(e)}")
+
+def aggregate_channel_features(df, method='mean'):
+    """
+    Aggregate features across channels for each subject
+    """
+    print(f"Aggregating features using {method} method...")
+    
+    feature_cols = [col for col in df.columns if col not in ['subject_id', 'group', 'channel']]
+    
+    if method == 'mean':
+        agg_df = df.groupby('subject_id')[feature_cols].mean()
+    elif method == 'std':
+        agg_df = df.groupby('subject_id')[feature_cols].std()
+    elif method == 'max':
+        agg_df = df.groupby('subject_id')[feature_cols].max()
+    elif method == 'min':
+        agg_df = df.groupby('subject_id')[feature_cols].min()
+    elif method == 'median':
+        agg_df = df.groupby('subject_id')[feature_cols].median()
+    
+    combined_df = agg_df.reset_index()
+    
+    group_info = df.groupby('subject_id')['group'].first().reset_index()
+    result_df = pd.merge(combined_df, group_info, on='subject_id')
+    
+    numeric_cols = result_df.select_dtypes(include=[np.number]).columns
+    result_df[numeric_cols] = result_df[numeric_cols].fillna(0)
+    
+    return result_df
+
+def create_balanced_dataset_multiclass(X, y):
+    """
+    Create balanced dataset using oversampling
+    """
+    from collections import Counter
+    
+    class_counts = Counter(y)
+    classes = list(class_counts.keys())
+    
+    if len(classes) <= 1:
+        return X, y
+    
+    max_count = max(class_counts.values())
+    
+    balanced_X = []
+    balanced_y = []
+    
+    for class_label in classes:
+        class_indices = np.where(y == class_label)[0]
+        current_count = len(class_indices)
+        
+        balanced_X.append(X[class_indices])
+        balanced_y.extend([class_label] * current_count)
+        
+        if current_count < max_count and current_count > 0:
+            n_to_add = max_count - current_count
+            additional_indices = np.random.choice(class_indices, size=n_to_add, replace=True)
+            balanced_X.append(X[additional_indices])
+            balanced_y.extend([class_label] * n_to_add)
+    
+    X_balanced = np.vstack(balanced_X)
+    y_balanced = np.array(balanced_y)
+    
+    return X_balanced, y_balanced
+
+def evaluate_classification(X, y, classifier, classifier_name, task_name, 
+                          dim_reduction_name=None, scaler_name='RobustScaler', 
+                          use_balancing=True, label_map=None, agg_method='mean'):
+    """
+    Perform cross-validation with FIXED probability handling
+    """
+    print(f"    Running {classifier_name} with {dim_reduction_name} and {scaler_name}...")
+    
+    if len(X) < 30:
+        cv = LeaveOneOut()
+    else:
+        cv = StratifiedKFold(n_splits=min(5, len(X)), shuffle=True, random_state=42)
+    
+    y_true = []
+    y_pred = []
+    y_pred_proba = []
+    
+    start_time = time.time()
+    
+    for fold, (train_idx, test_idx) in enumerate(cv.split(X, y)):
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+        
+        if use_balancing:
+            X_train, y_train = create_balanced_dataset_multiclass(X_train, y_train)
+        
+        # Scale features
+        scaler = scalers[scaler_name]
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        # Remove zero variance features
+        var_threshold = VarianceThreshold(threshold=0.0)
+        X_train_scaled = var_threshold.fit_transform(X_train_scaled)
+        X_test_scaled = var_threshold.transform(X_test_scaled)
+        
+        # Apply dimensionality reduction
+        if dim_reduction_name and dim_reduction_name != 'None':
+            try:
+                dim_methods = get_dim_reduction_methods(X_train_scaled.shape[1], X_train_scaled.shape[0])
+                if dim_reduction_name in dim_methods and dim_methods[dim_reduction_name] is not None:
+                    reducer = dim_methods[dim_reduction_name]
+                    
+                    if 'Select' in dim_reduction_name or 'RFE' in dim_reduction_name:
+                        X_train_reduced = reducer.fit_transform(X_train_scaled, y_train)
+                    else:
+                        X_train_reduced = reducer.fit_transform(X_train_scaled)
+                    X_test_reduced = reducer.transform(X_test_scaled)
+                else:
+                    X_train_reduced = X_train_scaled
+                    X_test_reduced = X_test_scaled
+                    
+            except Exception as e:
+                print(f"      Warning: {dim_reduction_name} failed: {str(e)[:50]}...")
+                X_train_reduced = X_train_scaled
+                X_test_reduced = X_test_scaled
+        else:
+            X_train_reduced = X_train_scaled
+            X_test_reduced = X_test_scaled
+        
+        if X_train_reduced.shape[1] == 0:
+            X_train_reduced = X_train_scaled
+            X_test_reduced = X_test_scaled
+        
+        # Train classifier
+        try:
+            clf = classifier
+            clf.fit(X_train_reduced, y_train)
+            
+            # Predict
+            pred = clf.predict(X_test_reduced)
+            
+            # FIXED: Get prediction probabilities consistently
+            n_classes_train = len(np.unique(y_train))
+            
+            if hasattr(clf, 'predict_proba'):
+                pred_proba = clf.predict_proba(X_test_reduced)
+            elif hasattr(clf, 'decision_function'):
+                decision = clf.decision_function(X_test_reduced)
+                if n_classes_train == 2:
+                    # Convert decision function to probabilities for binary
+                    pred_proba = np.column_stack([1 / (1 + np.exp(decision)), 
+                                                 1 / (1 + np.exp(-decision))])
+                else:
+                    # For multi-class, normalize decision scores
+                    decision_norm = decision - np.max(decision, axis=1, keepdims=True)
+                    exp_scores = np.exp(decision_norm)
+                    pred_proba = exp_scores / np.sum(exp_scores, axis=1, keepdims=True)
+            else:
+                # Create one-hot encoded probabilities
+                pred_proba = np.zeros((len(pred), n_classes_train))
+                for i, p in enumerate(pred):
+                    class_idx = np.where(clf.classes_ == p)[0][0] if hasattr(clf, 'classes_') else p
+                    pred_proba[i, class_idx] = 1.0
+            
+            # Store results
+            y_true.extend(y_test)
+            y_pred.extend(pred)
+            
+            # Handle single sample case
+            if pred_proba.ndim == 1:
+                pred_proba = pred_proba.reshape(1, -1)
+            
+            for i in range(pred_proba.shape[0]):
+                y_pred_proba.append(pred_proba[i])
+                
+        except Exception as e:
+            print(f"      Classifier error: {str(e)[:50]}...")
+            # Fallback to majority class
+            majority_class = np.bincount(y_train).argmax()
+            y_true.extend(y_test)
+            y_pred.extend([majority_class] * len(y_test))
+            
+            # Create dummy probabilities
+            n_classes_train = len(np.unique(y_train))
+            for _ in y_test:
+                dummy_proba = np.zeros(n_classes_train)
+                dummy_proba[majority_class] = 1.0
+                y_pred_proba.append(dummy_proba)
+    
+    end_time = time.time()
+    
+    # Convert to numpy arrays
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    y_pred_proba = np.array(y_pred_proba)
+    
+    if len(y_true) == 0 or len(y_pred) == 0:
+        return None
+    
+    # Calculate metrics
+    accuracy = accuracy_score(y_true, y_pred)
+    balanced_acc = balanced_accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+    f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+    specificity = calculate_specificity(y_true, y_pred)
+    
+    # Calculate AUC using fixed function
+    auc_score = calculate_multiclass_auc_fixed(y_true, y_pred_proba)
+    
+    cm = confusion_matrix(y_true, y_pred)
+    
+    # Create class names
+    if label_map:
+        class_names = [key for key, val in sorted(label_map.items(), key=lambda x: x[1])]
+    else:
+        unique_labels = np.unique(y_true)
+        class_names = [f'Class {i}' for i in unique_labels]
+    
+    # Generate plots
+    safe_task_name = task_name.replace('/', '_')
+    safe_classifier_name = classifier_name.replace('/', '_')
+    safe_dim_reduction = (dim_reduction_name or 'None').replace('/', '_')
+    safe_scaler = scaler_name.replace('/', '_')
+    safe_agg_method = agg_method.replace('/', '_')
+    
+    base_filename = f"{safe_task_name}_{safe_classifier_name}_{safe_dim_reduction}_{safe_scaler}_{safe_agg_method}"
+    
+    # Plot confusion matrix
+    cm_path = os.path.join('confusion_matrices', f'{base_filename}_confusion_matrix.png')
+    plot_confusion_matrix(cm, class_names, task_name, classifier_name, 
+                         dim_reduction_name or 'None', scaler_name, agg_method, cm_path)
+    
+    # Plot ROC curve using FIXED function
+    roc_path = os.path.join('roc_curves', f'{base_filename}_roc_curve.png')
+    plot_roc_curve_multiclass_fixed(y_true, y_pred_proba, task_name, classifier_name, 
+                                   dim_reduction_name or 'None', scaler_name, agg_method, class_names, roc_path)
+    
+    # Plot calibration curve
+    cal_path = os.path.join('calibration_plots', f'{base_filename}_calibration.png')
+    plot_calibration_curve_multiclass(y_true, y_pred_proba, task_name, classifier_name, 
+                                     dim_reduction_name or 'None', scaler_name, agg_method, cal_path)
+    
+    return {
+        'Task': task_name,
+        'Classifier': classifier_name,
+        'Dim_Reduction': dim_reduction_name if dim_reduction_name else 'None',
+        'Scaler': scaler_name,
+        'Accuracy': accuracy,
+        'Balanced_Accuracy': balanced_acc,
+        'Specificity': specificity,
+        'Precision': precision,
+        'F1_Score': f1,
+        'AUC': auc_score,
+        'Confusion_Matrix': cm,
+        'Runtime_seconds': end_time - start_time,
+        'N_samples': len(y_true),
+        'N_classes': len(np.unique(y_true)),
+        'Class_Distribution': str(np.bincount(y_true)),
+        'Y_true': y_true,
+        'Y_pred': y_pred,
+        'Y_pred_proba': y_pred_proba,
+        'Class_names': class_names
+    }
+
+def run_classification_experiments():
+    """
+    Run all classification experiments with enhanced preprocessing and visualization
+    """
+    print("Starting classification experiments...")
+    
+    aggregation_methods = ['mean']
+    selected_dim_methods = ['None', 'PCA_95', 'SelectKBest_F', 'VarianceThreshold']
+    selected_scalers = ['RobustScaler']
+    
+    all_results = []
+    
+    for agg_method in aggregation_methods:
+        print(f"\n{'='*60}")
+        print(f"AGGREGATION METHOD: {agg_method.upper()}")
+        print(f"{'='*60}")
+        
+        agg_df = aggregate_channel_features(df, method=agg_method)
+        
+        for task_name, groups in classification_tasks.items():
+            print(f"\n--- Task: {task_name} ---")
+            
+            task_df = agg_df[agg_df['group'].isin(groups)].copy()
+            
+            if len(task_df) == 0:
+                print(f"No data found for groups {groups}")
+                continue
+            
+            print(f"Samples: {len(task_df)} ({task_df['group'].value_counts().to_dict()})")
+            
+            feature_cols = [col for col in task_df.columns if col not in ['subject_id', 'group']]
+            X = task_df[feature_cols].values
+            y = task_df['group'].values
+            
+            # Encode labels consistently
+            unique_labels = sorted(np.unique(y))
+            label_map = {label: i for i, label in enumerate(unique_labels)}
+            y_encoded = np.array([label_map[label] for label in y])
+            
+            print(f"Features shape: {X.shape}")
+            print(f"Label mapping: {label_map}")
+            print(f"Number of classes: {len(unique_labels)}")
+            
+            # Handle missing/infinite values
+            X = np.nan_to_num(X, nan=0.0, posinf=1e10, neginf=-1e10)
+            
+            # Remove constant features
+            var_selector = VarianceThreshold(threshold=0.0)
+            X_filtered = var_selector.fit_transform(X)
+            print(f"Features after variance filtering: {X_filtered.shape}")
+            
+            if X_filtered.shape[1] == 0:
+                print("No features remaining after variance filtering!")
+                continue
+            
+            for scaler_name in selected_scalers:
+                print(f"\n  Scaler: {scaler_name}")
+                
+                for dim_method in selected_dim_methods:
+                    print(f"  Dimensionality Reduction: {dim_method}")
+                    
+                    for clf_name, clf in classifiers.items():
+                        try:
+                            result = evaluate_classification(X_filtered, y_encoded, clf, clf_name, task_name, 
+                                                           dim_method, scaler_name, use_balancing=True, 
+                                                           label_map=label_map, agg_method=agg_method)
+                            
+                            if result is not None:
+                                result['Aggregation_Method'] = agg_method
+                                result['Label_Mapping'] = str(label_map)
+                                all_results.append(result)
+                                
+                                print(f"      {clf_name}: Acc={result['Accuracy']:.3f}, "
+                                      f"Bal_Acc={result['Balanced_Accuracy']:.3f}, "
+                                      f"Spec={result['Specificity']:.3f}, "
+                                      f"F1={result['F1_Score']:.3f}, AUC={result['AUC']:.3f}")
+                            else:
+                                print(f"      {clf_name}: FAILED")
+                                
+                        except Exception as e:
+                            print(f"      {clf_name}: ERROR - {str(e)[:50]}...")
+    
+    return all_results
+
+def create_summary_plots(results):
+    """
+    Create summary visualization plots
+    """
+    print("Creating summary plots...")
+    
+    results_df = pd.DataFrame(results)
+    
+    # Performance comparison heatmap
+    plt.figure(figsize=(15, 10))
+    
+    pivot_acc = results_df.pivot_table(values='Balanced_Accuracy', 
+                                      index='Classifier', 
+                                      columns='Task', 
+                                      aggfunc='mean')
+    
+    sns.heatmap(pivot_acc, annot=True, fmt='.3f', cmap='RdYlBu_r', center=0.5)
+    plt.title('Average Balanced Accuracy by Classifier and Task')
+    plt.tight_layout()
+    plt.savefig('summary_performance_heatmap.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Box plots for metrics
+    metrics = ['Accuracy', 'Balanced_Accuracy', 'Specificity', 'F1_Score', 'AUC']
+    
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    axes = axes.ravel()
+    
+    for i, metric in enumerate(metrics):
+        sns.boxplot(data=results_df, x='Task', y=metric, hue='Classifier', ax=axes[i])
+        axes[i].set_title(f'{metric} Distribution by Task and Classifier')
+        axes[i].tick_params(axis='x', rotation=45)
+        if i < 3:
+            axes[i].legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        else:
+            axes[i].legend().remove()
+    
+    plt.tight_layout()
+    plt.savefig('summary_metrics_boxplots.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Configuration performance
+    plt.figure(figsize=(14, 8))
+    
+    config_perf = results_df.groupby(['Scaler', 'Dim_Reduction'])['Balanced_Accuracy'].mean().reset_index()
+    pivot_config = config_perf.pivot(index='Scaler', columns='Dim_Reduction', values='Balanced_Accuracy')
+    
+    sns.heatmap(pivot_config, annot=True, fmt='.3f', cmap='viridis')
+    plt.title('Average Balanced Accuracy by Scaler and Dimensionality Reduction')
+    plt.tight_layout()
+    plt.savefig('summary_configuration_performance.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Binary vs Multi-class comparison
+    if 'N_classes' in results_df.columns:
+        plt.figure(figsize=(12, 8))
+        
+        binary_results = results_df[results_df['N_classes'] == 2]
+        multiclass_results = results_df[results_df['N_classes'] > 2]
+        
+        if len(binary_results) > 0 and len(multiclass_results) > 0:
+            comparison_data = []
+            for _, row in binary_results.iterrows():
+                comparison_data.append({'Type': 'Binary', 'Classifier': row['Classifier'], 
+                                      'Balanced_Accuracy': row['Balanced_Accuracy']})
+            for _, row in multiclass_results.iterrows():
+                comparison_data.append({'Type': 'Multi-class', 'Classifier': row['Classifier'], 
+                                      'Balanced_Accuracy': row['Balanced_Accuracy']})
+            
+            comparison_df = pd.DataFrame(comparison_data)
+            sns.boxplot(data=comparison_df, x='Classifier', y='Balanced_Accuracy', hue='Type')
+            plt.title('Binary vs Multi-class Classification Performance')
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            plt.savefig('summary_binary_vs_multiclass.png', dpi=300, bbox_inches='tight')
+            plt.close()
+    
+    # Comprehensive metrics heatmap
+    plt.figure(figsize=(16, 10))
+    
+    metrics_pivot = results_df.groupby(['Classifier', 'Task'])[['Accuracy', 'Balanced_Accuracy','Specificity', 'F1_Score', 'AUC']].mean()
+    
+    sns.heatmap(metrics_pivot, annot=True, fmt='.3f', cmap='RdYlBu_r', center=0.5)
+    plt.title('Comprehensive Metrics Comparison: All Metrics by Classifier and Task')
+    plt.tight_layout()
+    plt.savefig('summary_comprehensive_metrics_heatmap.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print("Summary plots saved!")
+
+def create_best_results_plots(results):
+    """
+    Create detailed plots for the best performing configurations
+    """
+    print("Creating best results visualization...")
+    
+    results_df = pd.DataFrame(results)
+    
+    best_results = {}
+    for task in classification_tasks.keys():
+        task_results = results_df[results_df['Task'] == task]
+        if len(task_results) > 0:
+            best_idx = task_results['Balanced_Accuracy'].idxmax()
+            best_results[task] = results[best_idx]
+    
+    n_tasks = len(best_results)
+    fig, axes = plt.subplots(n_tasks, 3, figsize=(18, 6*n_tasks))
+    
+    if n_tasks == 1:
+        axes = axes.reshape(1, -1)
+    
+    for i, (task, result) in enumerate(best_results.items()):
+        # Confusion Matrix
+        cm = result['Confusion_Matrix']
+        cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        
+        sns.heatmap(cm_normalized, annot=True, fmt='.3f', cmap='Blues', 
+                   ax=axes[i, 0], xticklabels=result['Class_names'], 
+                   yticklabels=result['Class_names'])
+        axes[i, 0].set_title(f'{task} - Best Confusion Matrix\n{result["Classifier"]}')
+        axes[i, 0].set_ylabel('True Label')
+        axes[i, 0].set_xlabel('Predicted Label')
+        
+        # ROC Curve
+        try:
+            n_classes = result['N_classes']
+            y_true = result['Y_true']
+            y_pred_proba = result['Y_pred_proba']
+            
+            if n_classes == 2:
+                # Binary ROC curve
+                unique_labels = np.unique(y_true)
+                label_to_binary = {unique_labels[0]: 0, unique_labels[1]: 1}
+                y_true_binary = np.array([label_to_binary[label] for label in y_true])
+                
+                y_scores = y_pred_proba[:, 1] if y_pred_proba.shape[1] >= 2 else y_pred_proba[:, 0]
+                fpr, tpr, _ = roc_curve(y_true_binary, y_scores)
+                roc_auc = auc(fpr, tpr)
+                
+                axes[i, 1].plot(fpr, tpr, color='darkorange', lw=2, 
+                               label=f'ROC curve (AUC = {roc_auc:.3f})')
+                axes[i, 1].plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+            else:
+                # Multi-class ROC curve
+                sorted_unique = sorted(np.unique(y_true))
+                class_to_idx = {cls: idx for idx, cls in enumerate(sorted_unique)}
+                y_true_indexed = np.array([class_to_idx[label] for label in y_true])
+                y_true_bin = label_binarize(y_true_indexed, classes=list(range(len(sorted_unique))))
+                
+                colors = cycle(['aqua', 'darkorange', 'cornflowerblue'])
+                for j, color in zip(range(min(n_classes, 3)), colors):
+                    if j < y_pred_proba.shape[1]:
+                        fpr, tpr, _ = roc_curve(y_true_bin[:, j], y_pred_proba[:, j])
+                        roc_auc = auc(fpr, tpr)
+                        axes[i, 1].plot(fpr, tpr, color=color, lw=2,
+                                       label=f'Class {result["Class_names"][j]} (AUC = {roc_auc:.3f})')
+                
+                axes[i, 1].plot([0, 1], [0, 1], 'k--', lw=2)
+            
+            axes[i, 1].set_xlim([0.0, 1.0])
+            axes[i, 1].set_ylim([0.0, 1.05])
+            axes[i, 1].set_xlabel('False Positive Rate')
+            axes[i, 1].set_ylabel('True Positive Rate')
+            axes[i, 1].set_title(f'{task} - Best ROC Curve')
+            axes[i, 1].legend(loc="lower right")
+            axes[i, 1].grid(True, alpha=0.3)
+            
+        except Exception as e:
+            axes[i, 1].text(0.5, 0.5, f'ROC curve error: {str(e)[:30]}...', 
+                           ha='center', va='center', transform=axes[i, 1].transAxes)
+            axes[i, 1].set_title(f'{task} - ROC Curve (Error)')
+        
+        # Performance metrics bar plot
+        metrics = ['Accuracy', 'Balanced_Accuracy', 'Specificity', 'F1_Score', 'AUC']
+        values = [result[metric] for metric in metrics]
+        
+        bars = axes[i, 2].bar(metrics, values, color=['skyblue', 'lightcoral', 'lightgreen', 'orange', 'purple'])
+        axes[i, 2].set_ylim([0, 1])
+        axes[i, 2].set_title(f'{task} - Best Performance Metrics')
+        axes[i, 2].tick_params(axis='x', rotation=45)
+        
+        for bar, value in zip(bars, values):
+            axes[i, 2].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                           f'{value:.3f}', ha='center', va='bottom')
+    
+    plt.tight_layout()
+    plt.savefig('best_results_comprehensive.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print("Best results plots saved!")
+
+def save_results(results):
+    """
+    Save results and print comprehensive summary
+    """
+    print(f"\n{'='*60}")
+    print("RESULTS SUMMARY")
+    print(f"{'='*60}")
+    
+    if len(results) == 0:
+        print("No results to save - no experiments completed successfully.")
+        return pd.DataFrame(), pd.DataFrame()
+    
+    results_df = pd.DataFrame(results)
+    
+    # Prepare results for saving (remove large arrays)
+    save_results = []
+    for result in results:
+        save_result = result.copy()
+        for key in ['Y_true', 'Y_pred', 'Y_pred_proba', 'Class_names']:
+            if key in save_result:
+                del save_result[key]
+        save_results.append(save_result)
+    
+    save_results_df = pd.DataFrame(save_results)
+    
+    # Save detailed results
+    save_results_df.to_csv("EEG_classification_results_detailed.csv", index=False)
+    print("Detailed results saved to: EEG_classification_results_detailed.csv")
+    
+    # Create summary table
+    summary_cols = ['Task', 'Classifier', 'Dim_Reduction', 'Scaler', 'Aggregation_Method', 
+                   'Accuracy', 'Balanced_Accuracy','Specificity', 'F1_Score', 'AUC', 'N_samples', 'N_classes']
+    summary_df = save_results_df[summary_cols].copy()
+    summary_df = summary_df.round(3)
+    
+    summary_df.to_csv("EEG_classification_results_summary.csv", index=False)
+    print("Summary results saved to: EEG_classification_results_summary.csv")
+    
+    # Create visualization plots
+    create_summary_plots(results)
+    create_best_results_plots(results)
+    
+    # Print best results for each task
+    print(f"\nBEST RESULT FOR EACH CLASSIFICATION TASK:")
+    print("=" * 100)
+    
+    task_descriptions = {
+        'A_vs_F': 'Alzheimer\'s Disease (AD) vs Frontotemporal Dementia (FTD)',
+        'A_vs_C': 'Alzheimer\'s Disease (AD) vs Control',
+        'C_vs_F': 'Control vs Frontotemporal Dementia (FTD)',
+        'AD_vs_FTD_vs_CN': 'Alzheimer\'s Disease (AD) vs Frontotemporal Dementia (FTD) vs Control (CN)'
+    }
+    
+    for task in classification_tasks.keys():
+        task_results = save_results_df[save_results_df['Task'] == task]
+        if len(task_results) > 0:
+            best_result = task_results.loc[task_results['Balanced_Accuracy'].idxmax()]
+            
+            print(f"\n{task} - {task_descriptions.get(task, task)}:")
+            print("-" * 80)
+            print(f"Best Configuration:")
+            print(f"  Classifier: {best_result['Classifier']}")
+            print(f"  Dimensionality Reduction: {best_result['Dim_Reduction']}")
+            print(f"  Scaler: {best_result['Scaler']}")
+            print(f"  Aggregation Method: {best_result['Aggregation_Method']}")
+            print(f"  Label Mapping: {best_result['Label_Mapping']}")
+            print(f"  Number of Classes: {best_result['N_classes']}")
+            print(f"\nPerformance Metrics:")
+            print(f"  Accuracy: {best_result['Accuracy']:.4f}")
+            print(f"  Balanced Accuracy: {best_result['Balanced_Accuracy']:.4f}")
+            print(f"  Specificity: {best_result['Specificity']:.4f}")
+            print(f"  Precision: {best_result['Precision']:.4f}")
+            print(f"  F1-Score: {best_result['F1_Score']:.4f}")
+            print(f"  AUC: {best_result['AUC']:.4f}")
+            print(f"  Number of Samples: {best_result['N_samples']}")
+            print(f"  Class Distribution: {best_result['Class_Distribution']}")
+            print(f"  Runtime: {best_result['Runtime_seconds']:.2f} seconds")
+            print(f"  Confusion Matrix:\n{best_result['Confusion_Matrix']}")
+    
+    # Print average performance statistics
+    print(f"\nAVERAGE PERFORMANCE BY CLASSIFIER:")
+    print("-" * 60)
+    avg_performance = save_results_df.groupby('Classifier')[['Accuracy', 'Balanced_Accuracy','Specificity', 'F1_Score', 'AUC']].mean().round(3)
+    print(avg_performance)
+    
+    print(f"\nAVERAGE PERFORMANCE BY TASK:")
+    print("-" * 60)
+    task_performance = save_results_df.groupby('Task')[['Accuracy', 'Balanced_Accuracy', 'Specificity', 'F1_Score', 'AUC']].mean().round(3)
+    print(task_performance)
+    
+    if 'N_classes' in save_results_df.columns:
+        print(f"\nAVERAGE PERFORMANCE BY NUMBER OF CLASSES:")
+        print("-" * 60)
+        class_performance = save_results_df.groupby('N_classes')[['Accuracy', 'Balanced_Accuracy','Specificity', 'F1_Score', 'AUC']].mean().round(3)
+        print(class_performance)
+    
+    print(f"\nVISUALIZATIONS CREATED:")
+    print("-" * 40)
+    print("Individual plots saved in:")
+    print("  - confusion_matrices/ (confusion matrices for each configuration)")
+    print("  - roc_curves/ (ROC curves for each configuration)")
+    print("  - calibration_plots/ (calibration plots for each configuration)")
+    print("\nSummary plots:")
+    print("  - summary_performance_heatmap.png")
+    print("  - summary_metrics_boxplots.png")
+    print("  - summary_configuration_performance.png")
+    print("  - summary_binary_vs_multiclass.png")
+    print("  - summary_comprehensive_metrics_heatmap.png")
+    print("  - best_results_comprehensive.png")
+    
+    return save_results_df, summary_df
+
+def print_classification_report(results):
+    """
+    Print detailed classification report for best results
+    """
+    print(f"\nDETAILED CLASSIFICATION REPORTS:")
+    print("=" * 60)
+    
+    results_df = pd.DataFrame(results)
+    
+    for task in classification_tasks.keys():
+        task_results = [r for r in results if r['Task'] == task]
+        if task_results:
+            best_result = max(task_results, key=lambda x: x['Balanced_Accuracy'])
+            
+            print(f"\n{task} - Best Result ({best_result['Classifier']}):")
+            print("-" * 50)
+            
+            try:
+                y_true = best_result['Y_true']
+                y_pred = best_result['Y_pred']
+                class_names = best_result['Class_names']
+                
+                report = classification_report(y_true, y_pred, target_names=class_names, digits=4)
+                print(report)
+                
+            except Exception as e:
+                print(f"Could not generate classification report: {str(e)}")
+
+def main():
+    """
+    Main function to run all experiments
+    """
+    print("EEG Classification Analysis - Fixed ROC Curves Version")
+    print(f"Dataset shape: {df.shape}")
+    print(f"Groups available: {df['group'].unique()}")
+    print(f"Group counts: {df['group'].value_counts().to_dict()}")
+    print(f"Subjects: {df['subject_id'].nunique()}")
+    print(f"Channels: {df['channel'].nunique()}")
+    
+    print(f"\nGroup Label Mapping:")
+    print(f"A = Alzheimer's Disease (AD)")
+    print(f"C = Control (CN)")
+    print(f"F = Frontotemporal Dementia (FTD)")
+    
+    print(f"\nClassification Tasks:")
+    for task, groups in classification_tasks.items():
+        print(f"  {task}: {groups} ({'Binary' if len(groups) == 2 else 'Multi-class'})")
+    
+    print(f"\nMetrics to be calculated:")
+    print(f"  1. Accuracy")
+    print(f"  2. Balanced Accuracy")
+    print(f"  3. Specificity (True Negative Rate)")
+    print(f"  4. Precision")
+    print(f"  5. F1-Score")
+    print(f"  6. AUC (Area Under the Curve)")
+    
+    # Set random seed for reproducibility
+    np.random.seed(42)
+    
+    # Run experiments
+    start_time = time.time()
+    results = run_classification_experiments()
+    end_time = time.time()
+    
+    print(f"\nTotal runtime: {(end_time - start_time)/60:.2f} minutes")
+    print(f"Total experiments completed: {len(results)}")
+    
+    # Save and summarize results
+    results_df, summary_df = save_results(results)
+    print_classification_report(results)
+    
+    print(f"\n{'='*60}")
+    print("ANALYSIS COMPLETE!")
+    print(f"{'='*60}")
+    print(f"Check the following directories for detailed visualizations:")
+    print(f"  - confusion_matrices/ ({len([r for r in results if r is not None])} confusion matrices)")
+    print(f"  - roc_curves/ ({len([r for r in results if r is not None])} ROC curves) - FIXED!")
+    print(f"  - calibration_plots/ ({len([r for r in results if r is not None])} calibration plots)")
+    print(f"  - Summary plots in main directory")
+    
+    # Final summary statistics
+    if results:
+        binary_tasks = [r for r in results if r['N_classes'] == 2]
+        multiclass_tasks = [r for r in results if r['N_classes'] > 2]
+        
+        print(f"\nFINAL STATISTICS:")
+        print(f"  Binary classification experiments: {len(binary_tasks)}")
+        print(f"  Multi-class classification experiments: {len(multiclass_tasks)}")
+        
+        if binary_tasks:
+            avg_binary_acc = np.mean([r['Balanced_Accuracy'] for r in binary_tasks])
+            avg_binary_spec = np.mean([r['Specificity'] for r in binary_tasks])
+            avg_binary_auc = np.mean([r['AUC'] for r in binary_tasks if not np.isnan(r['AUC'])])
+            print(f"  Average binary classification accuracy: {avg_binary_acc:.4f}")
+            print(f"  Average binary classification specificity: {avg_binary_spec:.4f}")
+            print(f"  Average binary classification AUC: {avg_binary_auc:.4f}")
+        
+        if multiclass_tasks:
+            avg_multiclass_acc = np.mean([r['Balanced_Accuracy'] for r in multiclass_tasks])
+            avg_multiclass_spec = np.mean([r['Specificity'] for r in multiclass_tasks])
+            avg_multiclass_auc = np.mean([r['AUC'] for r in multiclass_tasks if not np.isnan(r['AUC'])])
+            print(f"  Average multi-class classification accuracy: {avg_multiclass_acc:.4f}")
+            print(f"  Average multi-class classification specificity: {avg_multiclass_spec:.4f}")
+            print(f"  Average multi-class classification AUC: {avg_multiclass_auc:.4f}")
+    
+    return results_df, summary_df
+
+if __name__ == "__main__":
+    results_df, summary_df = main()
