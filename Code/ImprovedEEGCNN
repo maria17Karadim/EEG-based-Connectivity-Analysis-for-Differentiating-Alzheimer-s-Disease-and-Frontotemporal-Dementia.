@@ -1,0 +1,1377 @@
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+# Suppress TensorFlow warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_curve, auc, balanced_accuracy_score
+from sklearn.utils.class_weight import compute_class_weight
+import tensorflow as tf
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import (Conv2D, MaxPooling2D, Dense, Dropout, 
+                                   BatchNormalization, GlobalAveragePooling2D,
+                                   Activation, Input, concatenate, Conv1D,
+                                   MaxPooling1D, GlobalMaxPooling2D, Lambda,
+                                   Reshape, Flatten)
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.utils import to_categorical
+import mne
+from scipy import signal
+from tqdm import tqdm
+from datetime import datetime
+import json
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import precision_recall_fscore_support
+
+# Create directories for saving plots
+os.makedirs('confusion_matrices', exist_ok=True)
+os.makedirs('roc_curves', exist_ok=True)
+
+
+class AdvancedMultiMethodCNN:
+    """
+    Advanced Multi-Method CNN for EEG classification implementing Experiment 3 requirements
+    """
+    
+    def __init__(self, data_path, participants_file, window_length=4.0, 
+                 overlap=0.75, freq_min=0.5, freq_max=45, nperseg=512):
+        """
+        Initialize the Advanced Multi-Method EEG CNN Classifier
+        """
+        self.data_path = data_path
+        self.participants_file = participants_file
+        self.window_length = window_length
+        self.overlap = overlap
+        self.freq_min = freq_min
+        self.freq_max = freq_max
+        self.nperseg = nperseg
+        self.model = None
+        self.label_encoder = LabelEncoder()
+        self.classification_task = None
+        
+        # Define frequency bands for analysis
+        self.frequency_bands = {
+            'delta': (0.5, 4),
+            'theta': (4, 8),
+            'alpha': (8, 13),
+            'beta': (13, 30),
+            'gamma': (30, 45)
+        }
+        
+        # Enhanced spatial electrode arrangement based on 10-20 system
+        self.electrode_positions = {
+            'Fp1': (0, 1), 'Fpz': (0, 2), 'Fp2': (0, 3),
+            'AF3': (0, 1), 'AF4': (0, 3), 'AFz': (0, 2),
+            'F7': (1, 0), 'F3': (1, 1), 'Fz': (1, 2), 'F4': (1, 3), 'F8': (1, 4),
+            'FT7': (2, 0), 'FC3': (2, 1), 'FCz': (2, 2), 'FC4': (2, 3), 'FT8': (2, 4),
+            'T7': (3, 0), 'C3': (3, 1), 'Cz': (3, 2), 'C4': (3, 3), 'T8': (3, 4),
+            'TP7': (4, 0), 'CP3': (4, 1), 'CPz': (4, 2), 'CP4': (4, 3), 'TP8': (4, 4),
+            'P7': (5, 0), 'P3': (5, 1), 'Pz': (5, 2), 'P4': (5, 3), 'P8': (5, 4),
+            'PO3': (6, 1), 'POz': (6, 2), 'PO4': (6, 3),
+            'O1': (7, 1), 'Oz': (7, 2), 'O2': (7, 3)
+        }
+        
+        # Define spatial grid size
+        self.spatial_grid_size = (8, 5)
+        
+        # Initialize consolidated results storage
+        self.all_results = []
+        
+        # Validate paths
+        self._validate_paths()
+        
+    def _validate_paths(self):
+        """Validate that required paths exist"""
+        if not os.path.exists(self.data_path):
+            raise ValueError(f"Data path does not exist: {self.data_path}")
+        if not os.path.exists(self.participants_file):
+            raise ValueError(f"Participants file does not exist: {self.participants_file}")
+
+    def load_eeg_data(self, subject_id):
+        """Load EEG data for a subject with multiple path attempts"""
+        potential_paths = [
+            os.path.join(self.data_path, f"sub-{subject_id:03d}", 
+                        "eeg", f"sub-{subject_id:03d}_task-eyesclosed_eeg.set"),
+            os.path.join(self.data_path, f"subject_{subject_id}.set"),
+            os.path.join(self.data_path, f"patient_{subject_id}_eeg.set"),
+            os.path.join(self.data_path, f"sub-{subject_id:03d}.set"),
+            os.path.join(self.data_path, f"sub-{subject_id:03d}", f"sub-{subject_id:03d}.set")
+        ]
+        
+        for file_path in potential_paths:
+            try:
+                if os.path.exists(file_path):
+                    raw = mne.io.read_raw_eeglab(file_path, preload=True, verbose=False)
+                    raw.pick("eeg")
+                    if raw.info['bads']:
+                        raw.drop_channels(raw.info['bads'])
+                    return raw.get_data(), raw.info['sfreq'], raw.ch_names
+            except Exception as e:
+                continue
+        
+        return None, None, None
+
+    def create_spatial_spectrograms(self, eeg_data, ch_names, sfreq):
+        """
+        Method 1: spatial_spectrograms
+        Arrange electrodes spatially, extract frequency bands for each spatial position
+        """
+        try:
+            n_channels, n_samples = eeg_data.shape
+            window_samples = int(self.window_length * sfreq)
+            step_samples = int(window_samples * (1 - self.overlap))
+            
+            if n_samples < window_samples:
+                return np.array([])
+            
+            nperseg = min(self.nperseg, window_samples // 4)
+            noverlap = int(nperseg * 0.75)
+            
+            spatial_spectrograms = []
+            
+            for start in range(0, n_samples - window_samples + 1, step_samples):
+                try:
+                    window_data = eeg_data[:, start:start + window_samples]
+                    window_data = window_data - np.mean(window_data, axis=1, keepdims=True)
+                    
+                    # Create separate spatial grid for each frequency band
+                    band_grids = {}
+                    
+                    for ch_idx, ch_name in enumerate(ch_names):
+                        if ch_name in self.electrode_positions:
+                            try:
+                                # Get spectrogram for this channel
+                                f, t, Sxx = signal.spectrogram(
+                                    window_data[ch_idx], 
+                                    fs=sfreq,
+                                    nperseg=nperseg,
+                                    noverlap=noverlap,
+                                    detrend='constant'
+                                )
+                                
+                                # Check for valid spectrogram
+                                if Sxx.size == 0 or np.any(np.isnan(Sxx)) or np.any(np.isinf(Sxx)):
+                                    continue
+                                
+                                row, col = self.electrode_positions[ch_name]
+                                
+                                # Extract each frequency band and place in spatial grid
+                                for band_name, (freq_low, freq_high) in self.frequency_bands.items():
+                                    freq_mask = (f >= freq_low) & (f <= freq_high)
+                                    if np.any(freq_mask):
+                                        band_power = np.mean(Sxx[freq_mask, :], axis=0)  # Average over frequencies in band
+                                        
+                                        if band_name not in band_grids:
+                                            band_grids[band_name] = np.zeros((*self.spatial_grid_size, len(band_power)))
+                                        
+                                        # Convert to dB and normalize safely
+                                        band_power_positive = np.maximum(band_power, np.finfo(float).eps)
+                                        band_power_db = 10 * np.log10(band_power_positive)
+                                        
+                                        # Robust normalization
+                                        if np.std(band_power_db) > 1e-10:
+                                            p1, p99 = np.percentile(band_power_db, [1, 99])
+                                            band_power_norm = np.clip((band_power_db - p1) / (p99 - p1 + 1e-10), 0, 1)
+                                        else:
+                                            band_power_norm = np.zeros_like(band_power_db)
+                                        
+                                        band_grids[band_name][row, col, :] = band_power_norm
+                                
+                            except Exception as e:
+                                continue
+                    
+                    # Stack frequency bands as channels (spatial_height, spatial_width, time, frequency_bands)
+                    if len(band_grids) > 0:
+                        # Rearrange to (time, spatial_height, spatial_width, frequency_bands)
+                        time_steps = next(iter(band_grids.values())).shape[2]
+                        combined_grid = np.zeros((time_steps, *self.spatial_grid_size, len(self.frequency_bands)))
+                        
+                        for band_idx, (band_name, grid) in enumerate(band_grids.items()):
+                            combined_grid[:, :, :, band_idx] = grid.transpose(2, 0, 1)  # (time, height, width)
+                        
+                        # Take average over time dimension to create 2D spatial representation
+                        spatial_representation = np.mean(combined_grid, axis=0)  # (height, width, freq_bands)
+                        
+                        # Check for valid representation
+                        if not np.any(np.isnan(spatial_representation)) and not np.any(np.isinf(spatial_representation)):
+                            spatial_spectrograms.append(spatial_representation)
+                
+                except Exception as e:
+                    continue
+            
+            return np.array(spatial_spectrograms) if len(spatial_spectrograms) > 0 else np.array([])
+            
+        except Exception as e:
+            print(f"Error in spatial_spectrograms: {str(e)}")
+            return np.array([])
+
+    def create_frequency_bands(self, eeg_data, ch_names, sfreq):
+        """
+        Method 2: frequency_bands  
+        Create separate images for each frequency band
+        """
+        try:
+            n_channels, n_samples = eeg_data.shape
+            window_samples = int(self.window_length * sfreq)
+            step_samples = int(window_samples * (1 - self.overlap))
+            
+            if n_samples < window_samples:
+                return np.array([])
+            
+            nperseg = min(self.nperseg, window_samples // 4)
+            noverlap = int(nperseg * 0.75)
+            
+            frequency_band_images = []
+            
+            for start in range(0, n_samples - window_samples + 1, step_samples):
+                try:
+                    window_data = eeg_data[:, start:start + window_samples]
+                    window_data = window_data - np.mean(window_data, axis=1, keepdims=True)
+                    
+                    # Create separate spectrograms for each frequency band
+                    band_spectrograms = []
+                    
+                    for band_name, (freq_low, freq_high) in self.frequency_bands.items():
+                        channel_spectrograms = []
+                        
+                        for ch_idx in range(len(ch_names)):
+                            try:
+                                f, t, Sxx = signal.spectrogram(
+                                    window_data[ch_idx], 
+                                    fs=sfreq,
+                                    nperseg=nperseg,
+                                    noverlap=noverlap,
+                                    detrend='constant'
+                                )
+                                
+                                # Filter to specific frequency band
+                                freq_mask = (f >= freq_low) & (f <= freq_high)
+                                if np.any(freq_mask):
+                                    Sxx_band = Sxx[freq_mask, :]
+                                    
+                                    if Sxx_band.size > 0 and not np.any(np.isnan(Sxx_band)) and not np.any(np.isinf(Sxx_band)):
+                                        # Convert to dB and normalize safely
+                                        Sxx_positive = np.maximum(Sxx_band, np.finfo(float).eps)
+                                        Sxx_db = 10 * np.log10(Sxx_positive)
+                                        
+                                        if np.std(Sxx_db) > 1e-10:
+                                            p1, p99 = np.percentile(Sxx_db, [1, 99])
+                                            Sxx_norm = np.clip((Sxx_db - p1) / (p99 - p1 + 1e-10), 0, 1)
+                                        else:
+                                            Sxx_norm = np.zeros_like(Sxx_db)
+                                        
+                                        channel_spectrograms.append(Sxx_norm)
+                                
+                            except Exception:
+                                continue
+                        
+                        if len(channel_spectrograms) > 0:
+                            # Stack channels for this frequency band
+                            try:
+                                band_spec = np.stack(channel_spectrograms, axis=-1)  # (freq, time, channels)
+                                band_spectrograms.append(band_spec)
+                            except Exception:
+                                continue
+                    
+                    # Combine frequency bands into single representation
+                    if len(band_spectrograms) > 0:
+                        try:
+                            # Ensure consistent dimensions across bands
+                            min_freq = min([spec.shape[0] for spec in band_spectrograms])
+                            min_time = min([spec.shape[1] for spec in band_spectrograms])
+                            min_channels = min([spec.shape[2] for spec in band_spectrograms])
+                            
+                            if min_freq > 0 and min_time > 0 and min_channels > 0:
+                                standardized_bands = []
+                                for band_spec in band_spectrograms:
+                                    cropped = band_spec[:min_freq, :min_time, :min_channels]
+                                    standardized_bands.append(cropped)
+                                
+                                # Concatenate along channel dimension
+                                combined_bands = np.concatenate(standardized_bands, axis=2)
+                                frequency_band_images.append(combined_bands)
+                        except Exception:
+                            continue
+                
+                except Exception:
+                    continue
+            
+            return np.array(frequency_band_images) if len(frequency_band_images) > 0 else np.array([])
+            
+        except Exception as e:
+            print(f"Error in frequency_bands: {str(e)}")
+            return np.array([])
+
+    def create_multi_channel(self, eeg_data, ch_names, sfreq):
+        """
+        Method 3: multi_channel
+        Stack electrode spectrograms as channels (traditional approach)
+        """
+        try:
+            n_channels, n_samples = eeg_data.shape
+            window_samples = int(self.window_length * sfreq)
+            step_samples = int(window_samples * (1 - self.overlap))
+            
+            if n_samples < window_samples:
+                return np.array([])
+            
+            nperseg = min(self.nperseg, window_samples // 4)
+            noverlap = int(nperseg * 0.75)
+            
+            multi_channel_spectrograms = []
+            
+            for start in range(0, n_samples - window_samples + 1, step_samples):
+                try:
+                    window_data = eeg_data[:, start:start + window_samples]
+                    window_data = window_data - np.mean(window_data, axis=1, keepdims=True)
+                    
+                    channel_spectrograms = []
+                    
+                    for ch_idx in range(len(ch_names)):
+                        try:
+                            f, t, Sxx = signal.spectrogram(
+                                window_data[ch_idx], 
+                                fs=sfreq,
+                                nperseg=nperseg,
+                                noverlap=noverlap,
+                                detrend='constant'
+                            )
+                            
+                            # Filter frequency range
+                            freq_mask = (f >= self.freq_min) & (f <= self.freq_max)
+                            Sxx_filtered = Sxx[freq_mask, :]
+                            
+                            if Sxx_filtered.size == 0:
+                                continue
+                            
+                            if not np.any(np.isnan(Sxx_filtered)) and not np.any(np.isinf(Sxx_filtered)):
+                                # Convert to dB and normalize safely
+                                Sxx_positive = np.maximum(Sxx_filtered, np.finfo(float).eps)
+                                Sxx_db = 10 * np.log10(Sxx_positive)
+                                
+                                if np.std(Sxx_db) > 1e-10:
+                                    p1, p99 = np.percentile(Sxx_db, [1, 99])
+                                    Sxx_norm = np.clip((Sxx_db - p1) / (p99 - p1 + 1e-10), 0, 1)
+                                else:
+                                    Sxx_norm = np.zeros_like(Sxx_db)
+                                
+                                channel_spectrograms.append(Sxx_norm)
+                            
+                        except Exception:
+                            continue
+                    
+                    if len(channel_spectrograms) > 0:
+                        try:
+                            # Stack as channels: (freq, time, channels)
+                            multi_channel_spec = np.stack(channel_spectrograms, axis=-1)
+                            if multi_channel_spec.shape[0] > 2 and multi_channel_spec.shape[1] > 2:
+                                multi_channel_spectrograms.append(multi_channel_spec)
+                        except Exception:
+                            continue
+                
+                except Exception:
+                    continue
+            
+            return np.array(multi_channel_spectrograms) if len(multi_channel_spectrograms) > 0 else np.array([])
+            
+        except Exception as e:
+            print(f"Error in multi_channel: {str(e)}")
+            return np.array([])
+
+    def create_hybrid(self, eeg_data, ch_names, sfreq):
+        """
+        Method 4: hybrid
+        Combine spatial and multi-channel approaches
+        """
+        try:
+            # Get both representations
+            spatial_data = self.create_spatial_spectrograms(eeg_data, ch_names, sfreq)
+            multi_channel_data = self.create_multi_channel(eeg_data, ch_names, sfreq)
+            
+            if len(spatial_data) == 0 or len(multi_channel_data) == 0:
+                return np.array([])
+            
+            # Ensure same number of time windows
+            min_windows = min(len(spatial_data), len(multi_channel_data))
+            spatial_data = spatial_data[:min_windows]
+            multi_channel_data = multi_channel_data[:min_windows]
+            
+            hybrid_representations = []
+            
+            for i in range(min_windows):
+                try:
+                    spatial_sample = spatial_data[i]  # (height, width, freq_bands)
+                    multi_channel_sample = multi_channel_data[i]  # (freq, time, channels)
+                    
+                    # Resize spatial to match multi-channel frequency dimension
+                    if spatial_sample.shape[0] != multi_channel_sample.shape[0]:
+                        # Simple interpolation to match frequency bins
+                        from scipy.ndimage import zoom
+                        scale_factors = (
+                            multi_channel_sample.shape[0] / spatial_sample.shape[0],
+                            1.0,  # Keep width same
+                            1.0   # Keep frequency bands same
+                        )
+                        spatial_resized = zoom(spatial_sample, scale_factors, order=1)
+                    else:
+                        spatial_resized = spatial_sample
+                    
+                    # Flatten spatial and concatenate with multi-channel
+                    spatial_flattened = spatial_resized.reshape(spatial_resized.shape[0], -1)  # (freq, spatial_features)
+                    
+                    # Reshape multi-channel to match
+                    multi_channel_reshaped = multi_channel_sample.reshape(multi_channel_sample.shape[0], -1)  # (freq, time*channels)
+                    
+                    # Concatenate along feature dimension
+                    hybrid_features = np.concatenate([spatial_flattened, multi_channel_reshaped], axis=1)
+                    
+                    # Reshape back to image-like format for CNN
+                    # Make it square-ish for CNN processing
+                    total_features = hybrid_features.shape[1]
+                    new_width = int(np.sqrt(total_features))
+                    if new_width * new_width < total_features:
+                        new_width += 1
+                    
+                    # Pad if necessary
+                    padded_features = np.pad(hybrid_features, 
+                                           ((0, 0), (0, new_width * new_width - total_features)), 
+                                           mode='constant', constant_values=0)
+                    
+                    # Reshape to 2D image format
+                    hybrid_image = padded_features.reshape(hybrid_features.shape[0], new_width, new_width)
+                    
+                    if not np.any(np.isnan(hybrid_image)) and not np.any(np.isinf(hybrid_image)):
+                        hybrid_representations.append(hybrid_image)
+                
+                except Exception:
+                    continue
+            
+            return np.array(hybrid_representations) if len(hybrid_representations) > 0 else np.array([])
+            
+        except Exception as e:
+            print(f"Error in hybrid: {str(e)}")
+            return np.array([])
+
+    def extract_all_representations(self, classification_task='advscn', 
+                                  max_windows_per_subject=75, 
+                                  methods=['spatial_spectrograms', 'frequency_bands', 'multi_channel', 'hybrid']):
+        """Extract all representation methods for all subjects according to Experiment 3"""
+        try:
+            participants = pd.read_csv(self.participants_file, sep='\t')
+        except Exception as e:
+            raise ValueError(f"Error reading participants file: {e}")
+        
+        # Define classification tasks
+        task_mapping = {
+            'advsftd': ['A', 'F'],        # AD vs FTD
+            'advscn': ['A', 'C'],         # AD vs Control  
+            'ftdvscn': ['F', 'C'],        # FTD vs Control
+            'advsftdvscn': ['A', 'F', 'C'], # AD vs FTD vs Control (3-class)
+        }
+        
+        if classification_task not in task_mapping:
+            raise ValueError(f"Invalid classification task: {classification_task}")
+        
+        self.classification_task = classification_task
+        target_groups = task_mapping[classification_task]
+        filtered_participants = participants[participants['Group'].isin(target_groups)]
+        
+        print(f"Processing {classification_task}: {len(filtered_participants)} participants")
+        
+        # Initialize storage for different methods
+        all_data = {}
+        for method in methods:
+            all_data[method] = {
+                'X': [],
+                'y': [],
+                'subject_ids': []
+            }
+        
+        successful_subjects = 0
+        
+        # Process each subject
+        for _, row in tqdm(filtered_participants.iterrows(), 
+                          total=len(filtered_participants), desc="Processing subjects"):
+            try:
+                subject_id = int(row['participant_id'].split('-')[1])
+                group = row['Group']
+                
+                # Load EEG data
+                eeg_data, sfreq, ch_names = self.load_eeg_data(subject_id)
+                if eeg_data is not None and ch_names is not None:
+                    
+                    # Extract different representations
+                    for method in methods:
+                        try:
+                            if method == 'spatial_spectrograms':
+                                data = self.create_spatial_spectrograms(eeg_data, ch_names, sfreq)
+                            elif method == 'frequency_bands':
+                                data = self.create_frequency_bands(eeg_data, ch_names, sfreq)
+                            elif method == 'multi_channel':
+                                data = self.create_multi_channel(eeg_data, ch_names, sfreq)
+                            elif method == 'hybrid':
+                                data = self.create_hybrid(eeg_data, ch_names, sfreq)
+                            else:
+                                continue
+                            
+                            if len(data) > 0:
+                                n_windows = min(len(data), max_windows_per_subject)
+                                if n_windows > 0:
+                                    indices = np.random.choice(len(data), n_windows, replace=False)
+                                    all_data[method]['X'].extend(data[indices])
+                                    all_data[method]['y'].extend([group] * n_windows)
+                                    all_data[method]['subject_ids'].extend([subject_id] * n_windows)
+                        
+                        except Exception as e:
+                            print(f"Error with {method} for subject {subject_id}: {str(e)}")
+                            continue
+                    
+                    successful_subjects += 1
+                
+            except Exception as e:
+                print(f"Warning: Error processing subject {subject_id}: {e}")
+                continue
+        
+        # Convert to arrays and encode labels
+        processed_data = {}
+        for method in methods:
+            if len(all_data[method]['X']) > 0:
+                X = np.array(all_data[method]['X'])
+                y = self.label_encoder.fit_transform(all_data[method]['y'])
+                subject_ids = all_data[method]['subject_ids']
+                
+                processed_data[method] = {
+                    'X': X,
+                    'y': y,
+                    'subject_ids': subject_ids
+                }
+                
+                print(f"{method}: {X.shape[0]} samples, shape: {X.shape}")
+            else:
+                print(f"{method}: No data extracted")
+        
+        return processed_data
+
+    def calculate_comprehensive_metrics(self, y_true, y_pred_classes, y_pred_proba, num_classes):
+        """Calculate the requested metrics: Accuracy, Balanced Accuracy, Specificity, F1 Score, and AUC"""
+        metrics = {}
+        
+        # Accuracy - Overall correctness of the model's predictions
+        accuracy = accuracy_score(y_true, y_pred_classes)
+        metrics['accuracy'] = accuracy
+        
+        # Balanced Accuracy - Average of recall obtained on each class, useful for imbalanced datasets
+        balanced_accuracy = balanced_accuracy_score(y_true, y_pred_classes)
+        metrics['balanced_accuracy'] = balanced_accuracy
+        
+        # Get confusion matrix for specificity calculation
+        cm = confusion_matrix(y_true, y_pred_classes)
+        
+        if num_classes == 2:
+            # Binary classification metrics
+            tn, fp, fn, tp = cm.ravel()
+            
+            # Specificity - True Negative Rate; ability to correctly identify negative cases
+            specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+            metrics['specificity'] = specificity
+            
+            # F1 Score - Harmonic mean of Precision and Recall, balancing both metrics
+            precision, recall, f1_score, support = precision_recall_fscore_support(
+                y_true, y_pred_classes, average='binary', zero_division=0
+            )
+            metrics['f1_score'] = f1_score
+            
+            # AUC - Area Under the Curve: Aggregate measure of performance across all classification thresholds
+            try:
+                fpr, tpr, _ = roc_curve(y_true, y_pred_proba)
+                auc_score = auc(fpr, tpr)
+                metrics['auc'] = auc_score
+            except:
+                metrics['auc'] = np.nan
+                
+        else:
+            # Multi-class metrics (macro-averaged)
+            # F1 Score - Harmonic mean of Precision and Recall, balancing both metrics
+            precision, recall, f1_score, support = precision_recall_fscore_support(
+                y_true, y_pred_classes, average='macro', zero_division=0
+            )
+            metrics['f1_score'] = f1_score
+            
+            # Specificity for multi-class - calculate for each class and average
+            specificities = []
+            for class_idx in range(num_classes):
+                tp = cm[class_idx, class_idx]
+                fn = np.sum(cm[class_idx, :]) - tp
+                fp = np.sum(cm[:, class_idx]) - tp
+                tn = np.sum(cm) - tp - fn - fp
+                
+                class_specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+                specificities.append(class_specificity)
+            
+            metrics['specificity'] = np.mean(specificities)
+            
+            # AUC for multi-class (macro-averaged)
+            try:
+                from sklearn.metrics import roc_auc_score
+                auc_score = roc_auc_score(y_true, y_pred_proba, multi_class='ovr', average='macro')
+                metrics['auc'] = auc_score
+            except:
+                metrics['auc'] = np.nan
+        
+        return metrics, cm
+
+    def build_adaptive_cnn_architecture(self, input_shape, num_classes):
+        """Build adaptive CNN architecture that handles different input shapes"""
+        height, width, channels = input_shape
+        
+        model = Sequential()
+        
+        # First block - always use same padding to preserve dimensions better
+        model.add(Conv2D(32, (3, 3), padding='same', input_shape=input_shape,
+                        kernel_initializer='he_normal', kernel_regularizer=l2(0.0001)))
+        model.add(BatchNormalization())
+        model.add(Activation('relu'))
+        
+        # Only add pooling if dimensions allow it
+        if height >= 4 and width >= 4:
+            model.add(MaxPooling2D((2, 2)))
+            model.add(Dropout(0.1))
+            
+            # Second block
+            model.add(Conv2D(64, (3, 3), padding='same',
+                            kernel_initializer='he_normal', kernel_regularizer=l2(0.0001)))
+            model.add(BatchNormalization())
+            model.add(Activation('relu'))
+            model.add(Conv2D(64, (3, 3), padding='same',
+                            kernel_initializer='he_normal', kernel_regularizer=l2(0.0001)))
+            model.add(BatchNormalization())
+            model.add(Activation('relu'))
+            
+            # Only add second pooling if dimensions still allow it
+            current_h = height // 2
+            current_w = width // 2
+            if current_h >= 4 and current_w >= 4:
+                model.add(MaxPooling2D((2, 2)))
+                model.add(Dropout(0.15))
+                
+                # Third block
+                model.add(Conv2D(128, (3, 3), padding='same',
+                                kernel_initializer='he_normal', kernel_regularizer=l2(0.0001)))
+                model.add(BatchNormalization())
+                model.add(Activation('relu'))
+                model.add(Conv2D(128, (3, 3), padding='same',
+                                kernel_initializer='he_normal', kernel_regularizer=l2(0.0001)))
+                model.add(BatchNormalization())
+                model.add(Activation('relu'))
+                
+                # Only add third pooling if dimensions still allow it
+                current_h = current_h // 2
+                current_w = current_w // 2
+                if current_h >= 2 and current_w >= 2:
+                    model.add(MaxPooling2D((2, 2)))
+                    model.add(Dropout(0.2))
+            else:
+                model.add(Dropout(0.15))
+        else:
+            # For very small inputs, skip pooling
+            model.add(Dropout(0.1))
+            
+            # Add more conv layers instead
+            model.add(Conv2D(64, (3, 3), padding='same',
+                            kernel_initializer='he_normal', kernel_regularizer=l2(0.0001)))
+            model.add(BatchNormalization())
+            model.add(Activation('relu'))
+            model.add(Dropout(0.15))
+            
+            model.add(Conv2D(128, (3, 3), padding='same',
+                            kernel_initializer='he_normal', kernel_regularizer=l2(0.0001)))
+            model.add(BatchNormalization())
+            model.add(Activation('relu'))
+            model.add(Dropout(0.2))
+        
+        # Global pooling and dense layers
+        model.add(GlobalAveragePooling2D())
+        
+        model.add(Dense(256, kernel_regularizer=l2(0.001), kernel_initializer='he_normal'))
+        model.add(BatchNormalization())
+        model.add(Activation('relu'))
+        model.add(Dropout(0.5))
+        
+        model.add(Dense(128, kernel_regularizer=l2(0.001), kernel_initializer='he_normal'))
+        model.add(BatchNormalization())
+        model.add(Activation('relu'))
+        model.add(Dropout(0.3))
+        
+        # Output layer
+        if num_classes == 2:
+            model.add(Dense(1, activation='sigmoid', 
+                           kernel_initializer='glorot_normal'))
+        else:
+            model.add(Dense(num_classes, activation='softmax',
+                           kernel_initializer='glorot_normal'))
+        
+        return model
+    
+    def focal_loss(self, y_true, y_pred, alpha=0.75, gamma=2.0):
+        """Focal loss for handling class imbalance"""
+        epsilon = tf.keras.backend.epsilon()
+        y_pred = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
+        
+        alpha_t = alpha * y_true + (1 - alpha) * (1 - y_true)
+        p_t = y_true * y_pred + (1 - y_true) * (1 - y_pred)
+        focal_loss = -alpha_t * tf.pow((1 - p_t), gamma) * tf.math.log(p_t)
+        
+        return tf.reduce_mean(focal_loss)
+
+    def prepare_data_with_subject_split(self, data_dict, method, test_size=0.2, val_size=0.1, 
+                                      random_state=42):
+        """Prepare train/validation/test splits ensuring no subject overlap"""
+        if method not in data_dict:
+            raise ValueError(f"Method {method} not found in data")
+        
+        X = data_dict[method]['X']
+        y = data_dict[method]['y']
+        subject_ids = data_dict[method]['subject_ids']
+        
+        unique_subjects = np.unique(subject_ids)
+        subject_labels = []
+        
+        for subj in unique_subjects:
+            mask = np.array(subject_ids) == subj
+            label = y[mask][0]
+            subject_labels.append(label)
+        
+        subject_labels = np.array(subject_labels)
+        
+        # Split subjects first
+        subjects_train, subjects_test, _, _ = train_test_split(
+            unique_subjects, subject_labels, test_size=test_size,
+            stratify=subject_labels, random_state=random_state
+        )
+        
+        # Further split training subjects for validation
+        train_labels = []
+        for subj in subjects_train:
+            mask = np.array(subject_ids) == subj
+            label = y[mask][0]
+            train_labels.append(label)
+        train_labels = np.array(train_labels)
+        
+        subjects_train, subjects_val, _, _ = train_test_split(
+            subjects_train, train_labels, 
+            test_size=val_size/(1-test_size),
+            stratify=train_labels, random_state=random_state
+        )
+        
+        # Create data splits
+        def get_data_for_subjects(subject_list):
+            mask = np.isin(subject_ids, subject_list)
+            return X[mask], y[mask], np.array(subject_ids)[mask]
+        
+        X_train, y_train, train_subject_ids = get_data_for_subjects(subjects_train)
+        X_val, y_val, val_subject_ids = get_data_for_subjects(subjects_val)
+        X_test, y_test, test_subject_ids = get_data_for_subjects(subjects_test)
+        
+        return (X_train, y_train), (X_val, y_val), (X_test, y_test, test_subject_ids)
+
+    def train_model(self, X_train, y_train, X_val, y_val, epochs=200, batch_size=16):
+        """Train CNN model with improved error handling"""
+        try:
+            num_classes = len(np.unique(np.concatenate([y_train, y_val])))
+            
+            # Convert labels for multi-class
+            if num_classes > 2:
+                y_train = to_categorical(y_train, num_classes)
+                y_val = to_categorical(y_val, num_classes)
+            
+            # Build model with adaptive architecture
+            self.model = self.build_adaptive_cnn_architecture(X_train.shape[1:], num_classes)
+            
+            print(f"    Model input shape: {X_train.shape[1:]}")
+            print(f"    Number of classes: {num_classes}")
+            
+            # Optimizer
+            optimizer = Adam(learning_rate=0.001)
+            
+            # Compile model
+            if num_classes == 2:
+                self.model.compile(
+                    optimizer=optimizer,
+                    loss='binary_crossentropy',  # Use standard binary crossentropy instead of focal loss initially
+                    metrics=['accuracy']
+                )
+            else:
+                self.model.compile(
+                    optimizer=optimizer,
+                    loss='categorical_crossentropy',
+                    metrics=['accuracy']
+                )
+            
+            # Class weights
+            if num_classes == 2:
+                y_for_weights = y_train
+            else:
+                y_for_weights = np.argmax(y_train, axis=1)
+            
+            try:
+                class_weights = compute_class_weight('balanced', 
+                                               classes=np.unique(y_for_weights), 
+                                               y=y_for_weights)
+                class_weight_dict = dict(enumerate(class_weights))
+            except Exception:
+                class_weight_dict = None
+            
+            # Callbacks
+            callbacks = [
+                EarlyStopping(
+                    patience=30,
+                    restore_best_weights=True,
+                    monitor='val_accuracy',
+                    verbose=0
+                ),
+                ReduceLROnPlateau(
+                    patience=20,
+                    factor=0.2,
+                    min_lr=1e-7,
+                    monitor='val_loss',
+                    verbose=0
+                )
+            ]
+            
+            # Train model
+            history = self.model.fit(
+                X_train, y_train,
+                validation_data=(X_val, y_val),
+                epochs=epochs,
+                batch_size=batch_size,
+                class_weight=class_weight_dict,
+                callbacks=callbacks,
+                verbose=0
+            )
+            
+            return history
+            
+        except Exception as e:
+            print(f"    Error during training: {str(e)}")
+            raise
+    
+    def evaluate_model(self, X_test, y_test, test_subject_ids=None):
+        """Evaluate model performance with improved error handling"""
+        if self.model is None:
+            raise ValueError("Model not trained yet!")
+        
+        try:
+            y_pred_proba = self.model.predict(X_test, verbose=0)
+            num_classes = len(self.label_encoder.classes_)
+            
+            if num_classes == 2:
+                y_pred_classes = (y_pred_proba > 0.5).astype(int).flatten()
+                y_pred_proba_for_metrics = y_pred_proba.flatten()
+            else:
+                y_pred_classes = np.argmax(y_pred_proba, axis=1)
+                y_test = np.argmax(y_test, axis=1) if y_test.ndim > 1 else y_test
+                y_pred_proba_for_metrics = y_pred_proba  # Keep full probability matrix for multi-class AUC
+            
+            # Calculate comprehensive metrics
+            metrics, cm = self.calculate_comprehensive_metrics(
+                y_test, y_pred_classes, y_pred_proba_for_metrics, num_classes
+            )
+            
+            results = {
+                'accuracy': metrics['accuracy'],
+                'balanced_accuracy': metrics['balanced_accuracy'],
+                'specificity': metrics['specificity'],
+                'f1_score': metrics['f1_score'],
+                'auc': metrics['auc'],
+                'confusion_matrix': cm,
+                'predictions': y_pred_classes,
+                'prediction_probabilities': y_pred_proba_for_metrics,
+                'test_subject_ids': test_subject_ids,
+                'y_true': y_test,
+                'num_classes': num_classes  # Add this for plotting
+            }
+            
+            return results
+            
+        except Exception as e:
+            print(f"    Error during evaluation: {str(e)}")
+            raise
+
+    def plot_confusion_matrix(self, cm, class_names, task_name, method_name, save_path=None):
+        """Plot and save confusion matrix"""
+        try:
+            plt.figure(figsize=(8, 6))
+            
+            # Create subplot for both raw and normalized
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            
+            # Raw confusion matrix
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax1,
+                        xticklabels=class_names, yticklabels=class_names)
+            ax1.set_title(f'Confusion Matrix (Raw Counts)\n{task_name}')
+            ax1.set_ylabel('True Label')
+            ax1.set_xlabel('Predicted Label')
+            
+            # Normalized confusion matrix
+            cm_normalized = cm.astype('float') / (cm.sum(axis=1)[:, np.newaxis] + 1e-10)
+            sns.heatmap(cm_normalized, annot=True, fmt='.3f', cmap='Blues', ax=ax2,
+                        xticklabels=class_names, yticklabels=class_names)
+            ax2.set_title(f'Confusion Matrix (Normalized)\n{task_name}')
+            ax2.set_ylabel('True Label')
+            ax2.set_xlabel('Predicted Label')
+            
+            fig.suptitle(f'{task_name} - {method_name}', fontsize=12, y=0.95)
+            plt.tight_layout()
+            
+            if save_path:
+                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                print(f"    Confusion matrix saved: {save_path}")
+            
+            plt.close()
+            
+        except Exception as e:
+            print(f"    Error plotting confusion matrix: {str(e)}")
+
+    def plot_roc_curve(self, y_true, y_pred_proba, task_name, method_name, class_names, save_path=None, num_classes=2):
+        """Plot and save ROC curve - handles both binary and multi-class"""
+        try:
+            plt.figure(figsize=(10, 8))
+            
+            if num_classes == 2:
+                # Binary classification ROC curve
+                fpr, tpr, thresholds = roc_curve(y_true, y_pred_proba)
+                roc_auc = auc(fpr, tpr)
+                
+                plt.plot(fpr, tpr, color='darkorange', lw=2, 
+                        label=f'ROC curve (AUC = {roc_auc:.3f})')
+                plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', 
+                        label='Random Classifier')
+                
+                plt.xlim([0.0, 1.0])
+                plt.ylim([0.0, 1.05])
+                plt.xlabel('False Positive Rate')
+                plt.ylabel('True Positive Rate')
+                plt.title(f'ROC Curve - {task_name}\n{method_name}')
+                plt.legend(loc="lower right")
+                plt.grid(True, alpha=0.3)
+                
+            else:
+                # Multi-class ROC curve (one-vs-rest)
+                from sklearn.preprocessing import label_binarize
+                
+                # Binarize the output labels for multi-class ROC
+                y_true_binarized = label_binarize(y_true, classes=list(range(num_classes)))
+                
+                # Compute ROC curve for each class
+                fpr = dict()
+                tpr = dict()
+                roc_auc = dict()
+                
+                colors = ['blue', 'red', 'green', 'orange', 'purple']
+                
+                for i in range(num_classes):
+                    fpr[i], tpr[i], _ = roc_curve(y_true_binarized[:, i], y_pred_proba[:, i])
+                    roc_auc[i] = auc(fpr[i], tpr[i])
+                    
+                    plt.plot(fpr[i], tpr[i], color=colors[i % len(colors)], lw=2,
+                            label=f'{class_names[i]} (AUC = {roc_auc[i]:.3f})')
+                
+                # Plot micro-average ROC curve
+                fpr["micro"], tpr["micro"], _ = roc_curve(y_true_binarized.ravel(), 
+                                                        y_pred_proba.ravel())
+                roc_auc["micro"] = auc(fpr["micro"], tpr["micro"])
+                
+                plt.plot(fpr["micro"], tpr["micro"], color='deeppink', lw=2, linestyle='--',
+                        label=f'Micro-average (AUC = {roc_auc["micro"]:.3f})')
+                
+                # Plot macro-average ROC curve
+                all_fpr = np.unique(np.concatenate([fpr[i] for i in range(num_classes)]))
+                mean_tpr = np.zeros_like(all_fpr)
+                
+                for i in range(num_classes):
+                    mean_tpr += np.interp(all_fpr, fpr[i], tpr[i])
+                
+                mean_tpr /= num_classes
+                fpr["macro"] = all_fpr
+                tpr["macro"] = mean_tpr
+                roc_auc["macro"] = auc(fpr["macro"], tpr["macro"])
+                
+                plt.plot(fpr["macro"], tpr["macro"], color='darkgreen', lw=2, linestyle=':',
+                        label=f'Macro-average (AUC = {roc_auc["macro"]:.3f})')
+                
+                plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', 
+                        label='Random Classifier')
+                
+                plt.xlim([0.0, 1.0])
+                plt.ylim([0.0, 1.05])
+                plt.xlabel('False Positive Rate')
+                plt.ylabel('True Positive Rate')
+                plt.title(f'Multi-class ROC Curves - {task_name}\n{method_name}')
+                plt.legend(loc="lower right", fontsize=9)
+                plt.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            
+            if save_path:
+                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                print(f"    ROC curve saved: {save_path}")
+            
+            plt.close()
+            
+            if num_classes == 2:
+                return roc_auc
+            else:
+                return roc_auc["macro"]
+                
+        except Exception as e:
+            print(f"    Error plotting ROC curve: {str(e)}")
+            return np.nan
+
+    def add_results_to_consolidated(self, group_comparison, method_name, metrics, history):
+        """Add results to consolidated storage"""
+        try:
+            best_epoch = np.argmin(history.history['val_loss']) + 1
+            final_train_loss = history.history['loss'][-1]
+            final_val_loss = history.history['val_loss'][-1]
+            
+            result_row = {
+                'group_comparison': group_comparison,
+                'method': method_name,
+                'accuracy': metrics['accuracy'],
+                'balanced_accuracy': metrics['balanced_accuracy'],
+                'specificity': metrics['specificity'],
+                'f1_score': metrics['f1_score'],
+                'auc': metrics['auc'],
+                'best_epoch': best_epoch,
+                'final_train_loss': final_train_loss,
+                'final_val_loss': final_val_loss,
+                'window_length': self.window_length,
+                'overlap': self.overlap
+            }
+            
+            self.all_results.append(result_row)
+            
+        except Exception as e:
+            print(f"    Error adding results to consolidated: {str(e)}")
+
+    def save_consolidated_results_csv(self, timestamp):
+        """Save all results to consolidated CSV"""
+        if not self.all_results:
+            print("No results to save!")
+            return None
+            
+        try:
+            filename = f"experiment3_advanced_multimethod_results_{timestamp}.csv"
+            
+            df = pd.DataFrame(self.all_results)
+            df.to_csv(filename, index=False)
+            print(f"\nConsolidated results saved to {filename}")
+            
+            # Print summary table
+            print(f"\n{'='*120}")
+            print("EXPERIMENT 3 - ADVANCED MULTI-METHOD RESULTS SUMMARY")
+            print(f"{'='*120}")
+            print(f"{'Group':<20} {'Method':<20} {'Acc':<6} {'Bal_Acc':<8} {'Spec':<6} {'F1':<6} {'AUC':<6}")
+            print(f"{'-'*120}")
+            
+            for _, row in df.iterrows():
+                print(f"{row['group_comparison']:<20} {row['method']:<20} "
+                      f"{row['accuracy']:<6.3f} {row['balanced_accuracy']:<8.3f} "
+                      f"{row['specificity']:<6.3f} {row['f1_score']:<6.3f} "
+                      f"{row['auc']:<6.3f}")
+            
+            return filename
+            
+        except Exception as e:
+            print(f"Error saving consolidated results: {str(e)}")
+            return None
+
+    def run_experiment3_comparison(self, classification_task='advscn',
+                                 methods=['spatial_spectrograms', 'frequency_bands', 'multi_channel', 'hybrid'],
+                                 max_windows_per_subject=75,
+                                 epochs=200, batch_size=16):
+        """
+        Run Experiment 3: Advanced Multi-Method CNN comparison with improved error handling
+        """
+        task_names = {
+            'advsftd': 'AD vs FTD',
+            'advscn': 'AD vs Control',
+            'ftdvscn': 'FTD vs Control',
+            'advsftdvscn': 'AD vs FTD vs Control'
+        }
+        
+        task_descriptions = {
+            'advsftd': 'Alzheimer\'s Disease (AD) vs Frontotemporal Dementia (FTD)',
+            'advscn': 'Alzheimer\'s Disease (AD) vs Control',
+            'ftdvscn': 'Frontotemporal Dementia (FTD) vs Control',
+            'advsftdvscn': 'AD vs FTD vs Control (3-class)'
+        }
+        
+        group_name = task_names.get(classification_task, classification_task)
+        task_description = task_descriptions.get(classification_task, classification_task)
+        
+        print(f"\n=== EXPERIMENT 3: {group_name} - Advanced Multi-Method CNN ===")
+        
+        method_results = {}
+        
+        try:
+            # Extract data using all advanced methods
+            print("Extracting data representations...")
+            all_data = self.extract_all_representations(
+                classification_task=classification_task,
+                max_windows_per_subject=max_windows_per_subject,
+                methods=methods
+            )
+            
+            # Process each method
+            for method in methods:
+                if method in all_data and len(all_data[method]['X']) > 0:
+                    print(f"\n--- Method: {method} ---")
+                    
+                    try:
+                        # Prepare data
+                        print("  Preparing data splits...")
+                        (X_train, y_train), (X_val, y_val), (X_test, y_test, test_subject_ids) = \
+                            self.prepare_data_with_subject_split(all_data, method)
+                        
+                        print(f"  Training samples: {len(X_train)}")
+                        print(f"  Validation samples: {len(X_val)}")
+                        print(f"  Test samples: {len(X_test)}")
+                        print(f"  Input shape: {X_train.shape[1:]}")
+                        
+                        # Check for minimum data requirements
+                        if len(X_train) < 10 or len(X_val) < 5 or len(X_test) < 5:
+                            print(f"  Insufficient data for {method}, skipping...")
+                            continue
+                        
+                        # Train
+                        print("  Training...", end=" ", flush=True)
+                        history = self.train_model(
+                            X_train, y_train, X_val, y_val,
+                            epochs=epochs,
+                            batch_size=batch_size
+                        )
+                        print("Done")
+                        
+                        # Evaluate
+                        print("  Evaluating...", end=" ", flush=True)
+                        results = self.evaluate_model(X_test, y_test, test_subject_ids)
+                        print("Done")
+                        
+                        method_results[method] = {
+                            'results': results,
+                            'history': history
+                        }
+                        
+                        # Add results to consolidated storage
+                        self.add_results_to_consolidated(
+                            classification_task, method, results, history
+                        )
+                        
+                        # Display results
+                        print(f"  Results:")
+                        print(f"    Accuracy: {results['accuracy']:.3f}")
+                        print(f"    Balanced Accuracy: {results['balanced_accuracy']:.3f}")
+                        print(f"    Specificity: {results['specificity']:.3f}")
+                        print(f"    F1-Score: {results['f1_score']:.3f}")
+                        if not np.isnan(results['auc']):
+                            print(f"    AUC: {results['auc']:.3f}")
+                        
+                        # Generate plots
+                        try:
+                            class_names = self.label_encoder.classes_
+                            safe_task_name = classification_task.replace('/', '_')
+                            safe_method_name = method.replace('/', '_')
+                            base_filename = f"exp3_{safe_task_name}_{safe_method_name}"
+                            
+                            # Confusion matrix
+                            cm_path = os.path.join('confusion_matrices', f'{base_filename}_confusion_matrix.png')
+                            self.plot_confusion_matrix(results['confusion_matrix'], class_names, 
+                                                     task_description, method, cm_path)
+                            
+                            # ROC curve (both binary and multi-class)
+                            roc_path = os.path.join('roc_curves', f'{base_filename}_roc_curve.png')
+                            if isinstance(results['prediction_probabilities'], np.ndarray):
+                                self.plot_roc_curve(results['y_true'], results['prediction_probabilities'], 
+                                                  task_description, method, class_names, roc_path, results['num_classes'])
+                        except Exception as plot_error:
+                            print(f"    Warning: Could not generate plots: {str(plot_error)}")
+                        
+                    except Exception as method_error:
+                        print(f"  Error with {method}: {str(method_error)}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
+                        
+                else:
+                    print(f"\n--- Method: {method} --- SKIPPED (No data)")
+            
+            # Display method comparison summary
+            if method_results:
+                print(f"\n--- EXPERIMENT 3 SUMMARY FOR {group_name} ---")
+                sorted_results = sorted(method_results.items(), 
+                                      key=lambda x: x[1]['results']['accuracy'], 
+                                      reverse=True)
+                
+                print(f"{'Method':<20} {'Accuracy':<10} {'Bal_Acc':<10} {'F1-Score':<10} {'AUC':<10}")
+                print(f"{'-'*60}")
+                
+                for method_name, data in sorted_results:
+                    acc = data['results']['accuracy']
+                    bal_acc = data['results']['balanced_accuracy']
+                    f1 = data['results']['f1_score']
+                    auc_val = data['results']['auc']
+                    if np.isnan(auc_val):
+                        auc_str = "N/A"
+                    else:
+                        auc_str = f"{auc_val:.3f}"
+                    print(f"{method_name:<20} {acc:.3f}      {bal_acc:.3f}      {f1:.3f}      {auc_str}")
+                
+                if sorted_results:
+                    best_method, best_data = sorted_results[0]
+                    best_acc = best_data['results']['accuracy']
+                    print(f"\nBest Method: {best_method} (Accuracy: {best_acc:.1%})")
+            else:
+                print(f"No successful results for {group_name}")
+            
+            return method_results
+            
+        except Exception as e:
+            print(f"Error in {group_name}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+
+def run_experiment3():
+    """
+    Run Experiment 3: Advanced Multi-Method CNN as specified
+    """
+    DATA_PATH = "derivatives"
+    PARTICIPANTS_FILE = "participants.tsv"
+    
+    # Experiment 3 specifications - MODIFIED TO INCLUDE 3-CLASS
+    TASKS = ['advscn', 'advsftd', 'ftdvscn', 'advsftdvscn']  # Added 3-class task
+    METHODS = ['spatial_spectrograms', 'frequency_bands', 'multi_channel', 'hybrid']
+    
+    print("EXPERIMENT 3: Advanced Multi-Method CNN")
+    print("=" * 80)
+    print("Configuration:")
+    print("  - Window length: 4.0 seconds")
+    print("  - Overlap: 75%")
+    print("  - Frequency resolution: nperseg=512")
+    print("  - Methods: spatial_spectrograms, frequency_bands, multi_channel, hybrid")
+    print("  - Tasks: Binary (AD vs CN, AD vs FTD, FTD vs CN) + 3-class (AD vs FTD vs CN)")
+    print("  - Expected best: spatial_spectrograms (80-90% accuracy)")
+    print("=" * 80)
+    
+    classifier = AdvancedMultiMethodCNN(
+        data_path=DATA_PATH,
+        participants_file=PARTICIPANTS_FILE,
+        window_length=4.0,
+        overlap=0.75,
+        nperseg=512
+    )
+    
+    all_results = {}
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    for task in TASKS:
+        try:
+            print(f"\n{'='*60}")
+            print(f"Processing Task: {task}")
+            print(f"{'='*60}")
+            
+            results = classifier.run_experiment3_comparison(
+                classification_task=task,
+                methods=METHODS,
+                max_windows_per_subject=75,
+                epochs=200,
+                batch_size=16
+            )
+            
+            if results:
+                all_results[task] = results
+            
+        except Exception as e:
+            print(f"Error with {task}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    # Save consolidated results
+    consolidated_csv = classifier.save_consolidated_results_csv(timestamp)
+    
+    # Final Experiment 3 Summary
+    print(f"\n{'='*120}")
+    print("EXPERIMENT 3 - FINAL RESULTS SUMMARY")
+    print(f"{'='*120}")
+    print(f"{'Task':<20} {'Spatial':<10} {'FreqBand':<10} {'MultiCh':<10} {'Hybrid':<10} {'Best Method':<15}")
+    print(f"{'-'*120}")
+    
+    task_names = {
+        'advscn': 'AD vs Control',
+        'advsftd': 'AD vs FTD',
+        'ftdvscn': 'FTD vs Control',
+        'advsftdvscn': 'AD vs FTD vs Control'  # Added 3-class
+    }
+    
+    for task, task_data in all_results.items():
+        task_name = task_names.get(task, task)
+        
+        spatial_acc = task_data.get('spatial_spectrograms', {}).get('results', {}).get('accuracy', 0)
+        freq_acc = task_data.get('frequency_bands', {}).get('results', {}).get('accuracy', 0)
+        multi_acc = task_data.get('multi_channel', {}).get('results', {}).get('accuracy', 0)
+        hybrid_acc = task_data.get('hybrid', {}).get('results', {}).get('accuracy', 0)
+        
+        # Determine best method
+        accuracies = {
+            'Spatial': spatial_acc, 
+            'FreqBand': freq_acc, 
+            'MultiCh': multi_acc, 
+            'Hybrid': hybrid_acc
+        }
+        best_method = max(accuracies.items(), key=lambda x: x[1])
+        
+        print(f"{task_name:<20} {spatial_acc:.3f}      {freq_acc:.3f}      {multi_acc:.3f}      {hybrid_acc:.3f}      {best_method[0]:<15}")
+    
+    print(f"{'-'*120}")
+    print("✓ Experiment completed with requested metrics only:")
+    print("   Accuracy: Overall correctness of predictions")
+    print("   Balanced Accuracy: Average of recall per class (useful for imbalanced datasets)")
+    print("   Specificity: True negative rate; ability to correctly identify negative cases")
+    print("   F1 Score: Harmonic mean of Precision and Recall")
+    print("   AUC: Area Under the Curve (aggregate measure across all thresholds)")
+    print("✓ Binary classifications: AD vs CN, AD vs FTD, FTD vs CN")
+    print("✓ Multi-class classification: AD vs FTD vs CN (3-class)")
+    print("✓ Results saved with comprehensive metrics")
+    print("✓ Method comparison completed")
+    if consolidated_csv:
+        print(f"✓ Consolidated results: {consolidated_csv}")
+    
+    return all_results, consolidated_csv
+
+
+if __name__ == "__main__":
+    # Set seeds for reproducibility
+    np.random.seed(42)
+    tf.random.set_seed(42)
+    
+    print("Starting Experiment 3 - Advanced Multi-Method CNN on EEG data...")
+
+    try:
+        all_results, consolidated_csv = run_experiment3()
+        print("\nExperiment 3 finished successfully.")
+        if consolidated_csv:
+            print(f"Consolidated results saved to: {consolidated_csv}")
+    except Exception as e:
+        print(f"An error occurred during Experiment 3: {e}")
