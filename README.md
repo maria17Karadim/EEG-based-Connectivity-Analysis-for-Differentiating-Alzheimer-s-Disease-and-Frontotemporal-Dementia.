@@ -1,7 +1,8 @@
 Introduction 
 Dementia represents a critical and growing challenge to global health, with Alzheimer's 
 Disease (AD) and Frontotemporal Dementia (FTD) being two of the most prevalent and 
-debilitating types. These neurodegenerative diseases lead to a gradual deterioration of 
+debilitating types. 
+These neurodegenerative diseases lead to a gradual deterioration of 
 cognitive abilities, significantly impacting the quality of life for patients and placing 
 substantial demands on caregivers and healthcare services. A key clinical hurdle is the 
 accurate distinction between AD, FTD, and normal aging—conditions that frequently share 
