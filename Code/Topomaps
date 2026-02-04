@@ -1,0 +1,375 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from matplotlib import colors
+from mne.viz import plot_topomap
+import mne
+from scipy import stats
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, confusion_matrix
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set style for better plots
+plt.rcParams['font.family'] = 'Arial'
+plt.rcParams['font.size'] = 12
+
+class EEGTopographicAnalyzer:
+    """
+    EEG Topographic Analysis Class - GitHub Style
+    Replicates the exact visualization from the Alzheimer's study
+    """
+    
+    def __init__(self, data_path):
+        """Initialize the analyzer with data path"""
+        self.data_path = data_path
+        self.df = None
+        self.info = None
+        self.channel_names = None
+        
+    def load_and_preprocess_data(self):
+        """Load and preprocess EEG data"""
+        print("=" * 60)
+        print("LOADING AND PREPROCESSING EEG DATA")
+        print("=" * 60)
+        
+        # Load data
+        self.df = pd.read_csv(self.data_path)
+        print(f"Data shape: {self.df.shape}")
+        print(f"Available groups: {self.df['group'].unique().tolist()}")
+        
+        # Get channel information
+        self.channel_names = sorted(self.df['channel'].unique().tolist())
+        print(f"Number of channels: {len(self.channel_names)}")
+        
+        # Create MNE info object for electrode positioning
+        self.info = mne.create_info(
+            ch_names=self.channel_names,
+            sfreq=1000,
+            ch_types='eeg'
+        )
+        
+        # Set standard montage
+        montage = mne.channels.make_standard_montage('standard_1020')
+        self.info.set_montage(montage, match_case=False, on_missing='ignore')
+        
+        print("✓ Data loaded and preprocessed successfully")
+        return self.df
+    
+    def create_github_style_topomaps(self, feature_columns, band_names, groups=None, 
+                                   figsize=(15, 12)):
+        """
+        Create topographic maps matching the exact GitHub style
+        """
+        print("\n" + "=" * 60)
+        print("CREATING GITHUB-STYLE TOPOGRAPHIC MAPS")
+        print("=" * 60)
+        
+        if groups is None:
+            groups = sorted(self.df['group'].unique().tolist())
+        
+        n_bands = len(feature_columns)
+        n_groups = len(groups)
+        
+        # Calculate group averages
+        avg_data = np.zeros((n_bands, n_groups, len(self.info['ch_names'])))
+        
+        for i, feature in enumerate(feature_columns):
+            print(f"Processing {feature}...")
+            
+            for j, group in enumerate(groups):
+                group_data = self.df[self.df['group'] == group]
+                
+                for k, ch_name in enumerate(self.info['ch_names']):
+                    ch_data = group_data[group_data['channel'] == ch_name][feature]
+                    if len(ch_data) > 0:
+                        avg_data[i, j, k] = ch_data.mean()
+                    else:
+                        avg_data[i, j, k] = np.nan
+        
+        # Create the figure with the exact GitHub layout
+        fig, axes = plt.subplots(n_bands, n_groups + 1, 
+                               figsize=figsize,
+                               gridspec_kw={'width_ratios': [1] * n_groups + [0.15],
+                                          'wspace': 0.1, 'hspace': 0.3})
+        
+        # Ensure axes is 2D
+        if n_bands == 1:
+            axes = axes.reshape(1, -1)
+        
+        # Define colormap similar to GitHub image
+        # Custom colormap that goes from purple (low) to yellow (high)
+        colors_list = ['#2D1B69', '#3E4A89', '#2E8B57', '#FFD700']  # Purple to yellow
+        custom_cmap = colors.LinearSegmentedColormap.from_list('custom', colors_list, N=256)
+        
+        for i in range(n_bands):
+            # Get value range for this feature across all groups
+            all_values = avg_data[i].flatten()
+            all_values = all_values[~np.isnan(all_values)]
+            
+            if len(all_values) == 0:
+                continue
+            
+            # Use the full range for better contrast
+            vmin = np.min(all_values)
+            vmax = np.max(all_values)
+            
+            # Ensure we have some range
+            if vmax == vmin:
+                vmax = vmin + 1e-10
+            
+            print(f"Feature {band_names[i]}: Value range [{vmin:.6f}, {vmax:.6f}]")
+            
+            # Plot topomaps for each group
+            for j in range(n_groups):
+                ax = axes[i, j]
+                
+                data_to_plot = avg_data[i, j].copy()
+                
+                # Create the topomap with GitHub-style parameters
+                im, cm = plot_topomap(
+                    data_to_plot, 
+                    self.info, 
+                    axes=ax, 
+                    show=False, 
+                    cmap=custom_cmap,
+                    vlim=(vmin, vmax),
+                    contours=12,  # More contour lines like in GitHub image
+                    sensors=False,  # No sensor dots for cleaner look
+                    names=None,
+                    mask=~np.isnan(data_to_plot),
+                    outlines='head',
+                    sphere=None,
+                    extrapolate='head'  # Extrapolate to head boundary
+                )
+                
+                # Clean up the axes
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.set_aspect('equal')
+                
+                # Add group labels at the top (only for first row)
+                if i == 0:
+                    ax.set_title(groups[j], fontsize=16, fontweight='bold', pad=20)
+            
+            # Add colorbar for each row (GitHub style)
+            cbar_ax = axes[i, -1]
+            
+            # Create colorbar
+            norm = colors.Normalize(vmin=vmin, vmax=vmax)
+            sm = plt.cm.ScalarMappable(cmap=custom_cmap, norm=norm)
+            sm.set_array([])
+            
+            cbar = fig.colorbar(sm, cax=cbar_ax, orientation='vertical')
+            cbar.ax.tick_params(labelsize=11)
+            
+            # Format colorbar labels to match GitHub style
+            if vmax - vmin < 0.01:  # For very small ranges
+                cbar.ax.ticklabel_format(style='scientific', scilimits=(0,0))
+                # Add power label (like "1e7" in GitHub image)
+                cbar.ax.text(1.5, 1.02, f'1e{int(np.log10(vmax))}', 
+                           transform=cbar.ax.transAxes, 
+                           fontsize=10, ha='center')
+            
+            # Add feature labels on the left (GitHub style)
+            fig.text(0.02, 
+                    1 - (i + 0.5) / n_bands,  # Position from top
+                    band_names[i], 
+                    rotation=90, 
+                    fontsize=16, 
+                    fontweight='bold',
+                    ha='center', 
+                    va='center')
+        
+        # Add colorbar label on the right
+        fig.text(0.98, 0.5, 'Power Score', rotation=90, 
+                fontsize=14, fontweight='bold',
+                ha='center', va='center')
+        
+        # Set background color like GitHub image
+        fig.patch.set_facecolor('#F5F5F5')
+        
+        plt.tight_layout()
+        return fig, avg_data
+    
+    def perform_statistical_analysis(self, feature_columns, groups=None):
+        """
+        Perform statistical analysis between groups
+        """
+        print("\n" + "=" * 60)
+        print("STATISTICAL ANALYSIS")
+        print("=" * 60)
+        
+        if groups is None:
+            groups = sorted(self.df['group'].unique().tolist())
+        
+        results = []
+        
+        if len(groups) == 2:  # Only for two-group comparison
+            for feature in feature_columns:
+                print(f"\nAnalyzing {feature}:")
+                
+                group1_data = self.df[self.df['group'] == groups[0]][feature]
+                group2_data = self.df[self.df['group'] == groups[1]][feature]
+                
+                # Basic statistics
+                print(f"  {groups[0]}: Mean={group1_data.mean():.6f}, Std={group1_data.std():.6f}")
+                print(f"  {groups[1]}: Mean={group2_data.mean():.6f}, Std={group2_data.std():.6f}")
+                
+                # Statistical test
+                t_stat, p_val = stats.ttest_ind(group1_data, group2_data)
+                print(f"  t-test: t={t_stat:.3f}, p={p_val:.6f}")
+                
+                # Effect size (Cohen's d)
+                pooled_std = np.sqrt(((len(group1_data) - 1) * group1_data.var() + 
+                                    (len(group2_data) - 1) * group2_data.var()) / 
+                                   (len(group1_data) + len(group2_data) - 2))
+                cohens_d = (group1_data.mean() - group2_data.mean()) / pooled_std
+                print(f"  Effect size (Cohen's d): {cohens_d:.3f}")
+                
+                results.append({
+                    'feature': feature,
+                    'group1_mean': group1_data.mean(),
+                    'group2_mean': group2_data.mean(),
+                    't_statistic': t_stat,
+                    'p_value': p_val,
+                    'cohens_d': cohens_d,
+                    'significant': p_val < 0.05
+                })
+        
+        return pd.DataFrame(results)
+    
+    def perform_classification_analysis(self, feature_columns, test_size=0.3, random_state=42):
+        """
+        Perform classification analysis
+        """
+        print("\n" + "=" * 60)
+        print("CLASSIFICATION ANALYSIS")
+        print("=" * 60)
+        
+        # Aggregate features per subject
+        subject_features = self.df.groupby(['subject_id', 'group'])[feature_columns].mean().reset_index()
+        
+        X = subject_features[feature_columns]
+        y = subject_features['group']
+        
+        print(f"Classification dataset shape: {X.shape}")
+        print(f"Class distribution:\n{y.value_counts()}")
+        
+        # Split and scale data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=random_state, stratify=y
+        )
+        
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        # Train classifier
+        rf_classifier = RandomForestClassifier(
+            n_estimators=100,
+            random_state=random_state,
+            max_depth=10
+        )
+        
+        rf_classifier.fit(X_train_scaled, y_train)
+        y_pred = rf_classifier.predict(X_test_scaled)
+        
+        # Results
+        print("\nClassification Results:")
+        print("=" * 40)
+        print(classification_report(y_test, y_pred))
+        
+        # Feature importance
+        feature_importance = pd.DataFrame({
+            'feature': feature_columns,
+            'importance': rf_classifier.feature_importances_
+        }).sort_values('importance', ascending=False)
+        
+        return rf_classifier, feature_importance, (X_train_scaled, X_test_scaled, y_train, y_test, y_pred)
+
+# ============================================================================
+# MAIN EXECUTION - GITHUB STYLE
+# ============================================================================
+
+def main():
+    """Main execution function - GitHub style analysis"""
+    print("EEG TOPOGRAPHIC ANALYSIS - GITHUB REPOSITORY STYLE")
+    print("Alzheimer's Disease Classification Methodology")
+    print("=" * 80)
+    
+    # Initialize analyzer
+    analyzer = EEGTopographicAnalyzer('EEG_channelwise_features.csv')
+    
+    # Load data
+    df = analyzer.load_and_preprocess_data()
+    
+    # Get available features
+    feature_cols = [col for col in df.columns 
+                   if col not in ['group', 'channel', 'subject_id']]
+    
+    # Define target features (modify based on your data)
+    target_features = [
+        'theta_power_mean',
+        'alpha_theta_ratio_mean', 
+        'beta_theta_ratio_mean'
+    ]
+    
+    # Check availability
+    available_features = [f for f in target_features if f in feature_cols]
+    
+    if not available_features:
+        print("Target features not found. Available features:")
+        print(feature_cols[:10])
+        # Use first available features
+        available_features = feature_cols[:3]
+    
+    print(f"\nUsing features: {available_features}")
+    
+    # Define band names (like in GitHub image)
+    band_names = ['Theta', 'Alpha/Theta', 'Beta/Theta'][:len(available_features)]
+    
+    # Create GitHub-style topomaps
+    print("\n" + "=" * 60)
+    print("CREATING TOPOGRAPHIC VISUALIZATION")
+    print("=" * 60)
+    
+    fig, avg_data = analyzer.create_github_style_topomaps(
+        available_features,
+        band_names,
+        figsize=(15, 10)
+    )
+    
+    # Perform statistical analysis
+    stats_results = analyzer.perform_statistical_analysis(available_features)
+    if not stats_results.empty:
+        print("\nStatistical Analysis Results:")
+        print(stats_results)
+    
+    # Perform classification (if binary classification)
+    groups = sorted(df['group'].unique())
+    if len(groups) == 2:
+        classifier, importance, classification_data = analyzer.perform_classification_analysis(
+            available_features
+        )
+        
+        print(f"\nTop 5 Most Important Features:")
+        print(importance.head())
+    
+    # Show the plot
+    plt.show()
+    
+    # Save figure
+    fig.savefig('eeg_topographic_analysis_github_style.png', 
+                dpi=300, bbox_inches='tight', facecolor='#F5F5F5')
+    print(f"\n✓ Figure saved as 'eeg_topographic_analysis_github_style.png'")
+    
+    print("\n" + "=" * 80)
+    print("ANALYSIS COMPLETE - GITHUB STYLE")
+    print("=" * 80)
+
+if __name__ == "__main__":
+    main()
