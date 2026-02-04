@@ -1,0 +1,68 @@
+<section>
+
+  <h2>🧠 Introduction</h2>
+
+  <p>
+    Dementia represents a critical and growing challenge to global health, with
+    <strong>Alzheimer’s Disease (AD)</strong> and
+    <strong>Frontotemporal Dementia (FTD)</strong> being among the most prevalent and
+    debilitating forms. These neurodegenerative disorders cause a progressive
+    decline in cognitive function, profoundly affecting patients’ quality of life
+    while placing substantial emotional, social, and economic burdens on caregivers
+    and healthcare systems.
+  </p>
+
+  <p>
+    One of the most significant clinical challenges lies in the
+    <strong>accurate differentiation between AD, FTD, and normal aging</strong>.
+    Although these conditions often present with overlapping symptoms during their
+    early stages, they differ markedly in their underlying neuropathological
+    mechanisms and disease progression. Early and reliable diagnosis is therefore
+    essential for effective intervention and disease management.
+  </p>
+
+  <p>
+    <strong>Electroencephalography (EEG)</strong> has emerged as a powerful,
+    non-invasive, and cost-effective technique for assessing brain function.
+    Unlike neuroimaging modalities that primarily provide structural information,
+    EEG captures neural activity with millisecond-level temporal resolution,
+    offering a direct window into the functional brain networks disrupted by
+    neurodegeneration.
+  </p>
+
+  <p>
+    In this context, <strong>functional connectivity analysis</strong>—which evaluates
+    statistical dependencies between neural signals across different brain regions—
+    has shown strong potential for revealing disease-specific network alterations.
+    AD is commonly associated with widespread disruptions in long-range connectivity,
+    whereas FTD predominantly affects frontal and temporal network integrity.
+  </p>
+
+  <p>
+    Traditional EEG analysis approaches typically rely on handcrafted features
+    combined with classical machine learning algorithms, such as
+    <em>Random Forests</em>, <em>Linear Discriminant Analysis (LDA)</em>,
+    <em>Radial Basis Function (RBF)</em> kernel methods, and
+    <em>Naïve Bayes</em> classifiers. More recently, deep learning techniques,
+    particularly <em>Convolutional Neural Networks (CNNs)</em>, have been explored as
+    an alternative paradigm for automated EEG signal analysis.
+  </p>
+
+  <p>
+    Both classical machine learning and deep learning approaches offer complementary
+    strengths in extracting meaningful patterns from EEG data. Building upon these
+    methodologies, this thesis aims to <strong>develop and compare hybrid frameworks</strong>
+    that integrate conventional machine learning techniques with CNN-based models,
+    specifically tailored for resting-state EEG recordings.
+  </p>
+
+  <p>
+    The primary objective is to automatically distinguish between
+    <strong>AD, FTD, and healthy control subjects</strong> while identifying robust,
+    interpretable EEG biomarkers that support early and accurate differential diagnosis.
+    Ultimately, this research seeks to provide a supplementary diagnostic tool to
+    assist clinicians in delivering timely, objective assessments and improving
+    patient care and management outcomes.
+  </p>
+
+</section>
